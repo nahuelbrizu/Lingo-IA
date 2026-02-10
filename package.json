@@ -1,0 +1,29 @@
+{
+  "name": "audio-project-backend",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "dev": "nodemon src/index.ts"
+  },
+  "dependencies": {
+    "@auth/prisma-adapter": "^2.11.1",
+    "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^7.3.0",
+    "dotenv": "^17.2.4",
+    "jsonwebtoken": "^9.0.3",
+    "next-auth": "^4.24.13",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.2.3",
+    "@types/ws": "^8.18.1",
+    "nodemon": "^3.1.11",
+    "prisma": "^7.3.0",
+    "prisma-cli": "^1.0.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

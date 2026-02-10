@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",                       // El código JavaScript de salida será compatible con ES2020
+    "module": "commonjs",                    // Usamos el sistema de módulos estándar de Node.js
+    "rootDir": "./src",                      // El código fuente TypeScript estará en la carpeta 'src'
+    "outDir": "./dist",                      // El código JavaScript compilado irá a la carpeta 'dist'
+    "esModuleInterop": true,                 // Permite una mejor interoperabilidad entre CommonJS y ES Modules
+    "forceConsistentCasingInFileNames": true,// Asegura que los nombres de archivo sean consistentes en mayúsculas/minúsculas
+    "strict": true,                          // Habilita todas las comprobaciones estrictas de tipos
+    "skipLibCheck": true                     // Omite la comprobación de tipos en los archivos de declaración (.d.ts)
+  },
+  "include": ["src/**/*"],                   // Qué archivos debe incluir TypeScript
+  "exclude": ["node_modules", "**/*.spec.ts"]// Qué carpetas y archivos debe ignorar
+}
