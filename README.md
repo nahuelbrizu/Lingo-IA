@@ -1,129 +1,97 @@
-# 🚀 Lingo-IA: Tu Tutor de Idiomas Inteligente y en Tiempo Real
+# Arquitectura del Motor Conversacional en Tiempo Real
 
-Lingo-IA es una aplicación de aprendizaje de idiomas de última generación que ofrece una experiencia de conversación inmersiva y personalizada. Utilizando una arquitectura nativa Speech-to-Speech (Voz-a-Voz) con latencia ultrabaja, Lingo-IA permite una interacción bidireccional fluida con un tutor de IA powered by Gemini 1.5 Flash Multimodal Live.
+Este documento detalla la arquitectura del sistema de conversación multi-sesión, diseñado para ser robusto, escalable y performante. La arquitectura se basa en principios de sistemas event-driven, máquinas de estado finitas y gestión de concurrencia para manejar interacciones de voz complejas en tiempo real.
 
-La IA no solo conversa, sino que gestiona de forma autónoma el progreso del usuario, evalúa la gramática y pronunciación, y actualiza el perfil de aprendizaje en tiempo real.
+## 1. Principios de Diseño
 
-## ✨ Características Principales
+- **Separación de Responsabilidades (SRP):** Cada módulo tiene una única y bien definida responsabilidad (ej. transporte de red, captura de audio, lógica de estado).
+- **Inmutabilidad y Flujo de Datos Unidireccional:** La lógica de estado es manejada por un reducer puro (FSM) que no tiene efectos secundarios. El estado fluye en una sola dirección: `Evento → FSM → Comando → Efecto Secundario`.
+- **Aislamiento de Sesiones:** Cada conversación es una unidad aislada con su propio estado. La interferencia entre sesiones (cross-talk) es prevenida a nivel de arquitectura.
+- **Cancelación Explícita:** Todos los flujos de trabajo asíncronos (streaming de LLM, TTS) son cancelables mediante un `generationId`, lo que permite interrupciones de baja latencia (barge-in).
+- **Gestión Centralizada de Recursos:** Los recursos de hardware compartidos (micrófono, altavoces) son gestionados por singletons globales con contadores de referencia para un uso eficiente.
 
-*   **Conversación Voz-a-Voz en Tiempo Real:** Interacción natural y fluida con la IA, sin esperas ni interrupciones.
-*   **Gestión Inteligente del Progreso:** La IA detecta automáticamente los temas dominados y los errores comunes, actualizando el perfil del usuario.
-*   **Feedback Pedagógico Personalizado:** Resúmenes detallados de cada sesión con puntos clave de mejora y aliento, guardados en el historial de aprendizaje.
-*   **Dashboard de Progreso Dinámico:** Visualiza tu nivel actual, habilidades desbloqueadas y feedback del tutor de IA en tiempo real.
-*   **Autenticación Segura:** Inicio de sesión con Google utilizando NextAuth.js para una experiencia de usuario segura y sin fricciones.
-*   **Procesamiento de Audio de Alto Rendimiento:** Uso de `AudioWorklet` en el frontend para garantizar un procesamiento de audio robusto y sin interrupciones en un hilo separado del navegador.
+## 2. Diagrama de Arquitectura Conceptual
 
-## 🏛️ Arquitectura
-
-Lingo-IA está construida sobre una arquitectura moderna y escalable:
-
-*   **Frontend:** Next.js (React) con Tailwind CSS para una interfaz de usuario limpia y moderna.
-    *   **Captura de Audio:** Web Audio API con `AudioWorklet` para un procesamiento de micrófono eficiente y en tiempo real.
-    *   **Comunicación:** WebSockets para el envío y recepción de chunks de audio y datos.
-*   **Backend:** Node.js (TypeScript) con un servidor WebSocket.
-    *   **IA Core:** Google Gemini 1.5 Flash Multimodal Live para la interacción conversacional.
-    *   **Function Calling:** Gemini utiliza herramientas (`Capabilities`) para interactuar con la base de datos (ej. `actualizar_progreso_usuario`, `cambiar_dificultad`).
-    *   **Autenticación:** NextAuth.js para la gestión de usuarios y sesiones seguras.
-    *   **Persistencia:** Prisma ORM para interactuar con la base de datos PostgreSQL.
-*   **Base de Datos:** PostgreSQL para almacenar perfiles de usuario, analíticas de aprendizaje y historial de lecciones.
-
-## 🚀 Configuración y Ejecución
-
-Sigue estos pasos para poner en marcha Lingo-IA en tu entorno local.
-
-### Prerrequisitos
-
-*   **Node.js** (v18 o superior)
-*   **npm** o **Yarn**
-*   **PostgreSQL** (instancia local o remota, ej. Supabase)
-*   **Cuenta de Google Cloud / Google AI Studio:** Necesitarás una `GEMINI_API_KEY` con acceso a `gemini-1.5-flash-latest` (o `gemini-2.0-flash-exp` para la voz optimizada).
-*   **Credenciales de Google OAuth:** Para NextAuth.js, necesitarás un `GOOGLE_CLIENT_ID` y `GOOGLE_CLIENT_SECRET` configurados en la consola de desarrolladores de Google.
-
-### 1. Configuración de Variables de Entorno
-
-Crea un archivo `.env` en la **raíz de tu proyecto** y configura las siguientes variables:
-
-```env
-# Google AI Studio / Gemini API Key
-GEMINI_API_KEY="TU_CLAVE_API_DE_GEMINI"
-
-# PostgreSQL Database
-DATABASE_URL="postgresql://user:password@localhost:5432/lingo_ia_db"
-
-# NextAuth.js (Genera una clave con `openssl rand -base64 32`)
-NEXTAUTH_SECRET="TU_SECRETO_PARA_NEXTAUTH"
-NEXTAUTH_URL="http://localhost:3000"
-
-# Google OAuth para NextAuth.js
-GOOGLE_CLIENT_ID="TU_CLIENT_ID_DE_GOOGLE"
-GOOGLE_CLIENT_SECRET="TU_CLIENT_SECRET_DE_GOOGLE"
-
-# Puerto del servidor backend
-PORT=8080
+```plaintext
+                   +--------------------------------+
+                   |           UI Layer             |
+                   | (React Components/Hooks)       |
+                   +--------------------------------+
+                                  ^
+                                  | (State Updates, Events)
+                                  v
++-------------------------------------------------------------------------+
+|                         Event Bus (Global)                              |
++-------------------------------------------------------------------------+
+       ^                                      |
+       | (Events from Services)               | (Events to Session Manager)
+       |                                      v
++-------------------------------------------------------------------------+
+|                          SessionManager (Singleton)                     |
+|-------------------------------------------------------------------------|
+| - Registry: Map<sessionId, SessionInstance>                             |
+| - Factory: createSession() / destroySession()                           |
+| - Router: Enruta eventos a la sesión correcta                           |
+| - Focus Control: Gestiona activeListeningSessionId                      |
++-------------------------------------------------------------------------+
+                                  |
+                                  | (Dispatches events to a specific instance)
+                                  v
++-------------------------------------------------------------------------+
+|                           SessionInstance                               |
+|-------------------------------------------------------------------------|
+| - Orchestrator (Maneja efectos secundarios)                             |
+| - FSM (Reducer puro, calcula el siguiente estado y comandos)            |
+| - State (chatHistory, activeGenerationId, tombstone)                    |
++-------------------------------------------------------------------------+
+       ^                         ^                         ^
+       | (Commands)              | (Audio Chunks)          | (TTS Audio Chunks)
+       v                         v                         v
++------------------+     +------------------+     +-----------------------+
+| WebSocketService |     | AudioInputManager|     | AudioOutputManager    |
+| (1 por Sesión)   |     | (Singleton)      |     | (Singleton)           |
++------------------+     +------------------+     +-----------------------+
 ```
 
-### 2. Configuración de la Base de Datos (Backend)
+## 3. Componentes Clave
 
-Navega al directorio raíz del proyecto en tu terminal.
+### 3.1. Singletons Globales (`/app/services`)
 
-```bash
-# Instala las dependencias del backend (incluyendo Prisma CLI)
-npm install
+- **`EventBus`:** Un bus de eventos Pub/Sub simple que actúa como el sistema nervioso central para la comunicación desacoplada.
+- **`AudioInputManager`:** Gestiona el acceso al micrófono. Utiliza un **contador de referencias** para iniciar `getUserMedia` solo cuando la primera sesión lo necesita y detenerlo cuando la última sesión termina. Despacha chunks de audio directamente a las sesiones suscritas para máxima eficiencia.
+- **`AudioOutputManager`:** Gestiona el `AudioContext` y la reproducción de audio. Implementa un **lock por `sessionId`** para prevenir que el audio de múltiples sesiones se mezcle. Incluye un **watchdog timer** para liberar el lock si la reproducción se atasca, previniendo deadlocks.
 
-# Aplica las migraciones de Prisma a tu base de datos PostgreSQL
-# Asegúrate de que tu `DATABASE_URL` en .env sea correcta.
-npx prisma migrate dev --name init-nextauth-models
-```
-*(Nota: El nombre de la migración `init-nextauth-models` es un ejemplo. Si ya ejecutaste migraciones antes, usa el nombre que corresponda o permite a Prisma sugerir uno.)*
+### 3.2. Arquitectura de Sesión (`/app/hooks/useConversation`)
 
-### 3. Ejecutar el Backend (Servidor Node.js)
+- **`SessionManager`:** El orquestador de la concurrencia.
+  - **Registry/Factory:** Crea, registra y destruye `SessionInstance`.
+  - **Router:** Escucha el `EventBus` global y enruta cada evento a la `SessionInstance` correspondiente basándose en el `sessionId`.
+  - **Focus Manager:** Controla qué sesión tiene el "foco de escucha" (`activeListeningSessionId`) para garantizar que solo una sesión procese activamente el audio del micrófono a la vez.
+  - **Garbage Collector:** Implementa un `setInterval` para destruir automáticamente las sesiones que han estado inactivas por más de un umbral definido, previniendo fugas de memoria.
 
-```bash
-# En modo desarrollo (con recarga automática al cambiar archivos .ts)
-npm run dev
+- **`SessionInstance`:** Encapsula todo lo relacionado con una única conversación.
+  - **`SessionOrchestrator`:** El "cerebro" de la sesión.
+    - Recibe eventos del `SessionManager`.
+    - Pasa el estado actual y el evento al `fsmReducer`.
+    - Ejecuta los `Commands` devueltos por la FSM, interactuando con los servicios (TTS, LLM, etc.).
+    - Gestiona el `activeGenerationId` y el `tombstone` set para la cancelación.
+  - **`FSM` (Reducer Puro):** Una función pura `(state, event) => ({ newState, commands })`. No tiene efectos secundarios. Su única responsabilidad es calcular el siguiente estado y la lista de acciones a realizar. Esto la hace extremadamente predecible y fácil de testear unitariamente.
 
-# Para compilar y ejecutar en producción
-# npm run build
-# npm start
-```
-El servidor backend escuchará en `http://localhost:8080` y en la conexión WebSocket `ws://localhost:8080`.
+### 3.3. El Mecanismo `generationId`
 
-### 4. Ejecutar el Frontend (Aplicación Next.js)
+El `generationId` es la piedra angular para prevenir race conditions en un entorno de streaming.
 
-Asegúrate de estar en el directorio raíz de tu proyecto.
+1.  **Creación:** Se crea un `generationId` único en el `Orchestrator` en el momento en que se inicia una nueva respuesta de IA (después de que el usuario termina de hablar).
+2.  **Propagación:** El `generationId` se propaga a través de toda la cadena de procesamiento: `LLMService` → `TTSService` → `AudioOutputManager`.
+3.  **Invalidación (Barge-in):** Cuando el usuario interrumpe, el `Orchestrator` establece inmediatamente su `activeGenerationId` a `null` y añade el ID cancelado a un `tombstone` set.
+4.  **Validación:** Todos los servicios y el `Orchestrator` validan los eventos entrantes. Si un evento llega con un `generationId` que no coincide con el `activeGenerationId`, es un "evento fantasma" de una generación anterior y se descarta de forma segura.
 
-```bash
-# Instala las dependencias del frontend
-npm install
+## 4. Testing
 
-# Ejecuta la aplicación Next.js en modo desarrollo
-npm run dev
-```
-La aplicación Next.js se iniciará en `http://localhost:3000`.
+La validación de esta arquitectura se basa en un "Test Harness" de grado de producción (`/app/hooks/useConversation/__tests__/harness`).
 
-### Uso
+- **Tests de Aislamiento y Fugas (`Isolation.test.ts`):** Verifica que el `SessionManager` limpia correctamente los recursos y que no hay "cross-talk" entre sesiones. Simula ciclos masivos de creación/destrucción para asegurar que los contadores de referencias y las desuscripciones funcionen.
+- **Fuzz Testing (`Fuzz.test.ts`):** Un motor de fuzzing "state-aware" ejecuta miles de secuencias de eventos aleatorios y corruptos contra el `Orchestrator`. Después de cada evento, un **`InvariantChecker`** valida que el estado interno del sistema no se haya corrompido. Si se detecta una violación, el test falla con la secuencia exacta de eventos para una reproducción determinista.
+- **Tests de Performance (`BargeIn.perf.test.ts`):** Un test automatizado mide la latencia de "barge-in" desde la detección de voz hasta la parada del audio. Calcula métricas como el promedio y el **percentil 95 (p95)** y falla el pipeline de CI/CD si no se cumple el Objetivo de Nivel de Servicio (SLO) definido (ej. p95 < 100ms).
 
-1.  Abre tu navegador y navega a `http://localhost:3000/dashboard`.
-2.  Haz clic en "Iniciar Sesión con Google" para autenticarte.
-3.  Una vez en el dashboard, verás tus datos de progreso. Haz clic en "Empezar a Hablar" para iniciar una sesión de conversación con el tutor de IA.
-4.  Observa cómo el indicador de voz reacciona a tu habla y cómo el dashboard se actualiza automáticamente al finalizar la sesión.
-
-## 🚀 Próximos Pasos y Mejoras Potenciales
-
-*   **UI/UX:**
-    *   Implementar un componente de chat en tiempo real para ver la transcripción y las respuestas de la IA.
-    *   Mejorar la animación del indicador de voz para un feedback más sofisticado.
-    *   Añadir más visualizaciones al dashboard (gráficas de progreso, etc.).
-*   **Manejo de Errores:**
-    *   Mejorar la gestión de errores en el frontend (ej. si el WebSocket se desconecta).
-    *   Validación más estricta del JSON devuelto por la IA para el resumen pedagógico.
-*   **Características de IA:**
-    *   Permitir al usuario seleccionar el tema de la lección o el nivel de dificultad.
-    *   Integrar más herramientas (ej. "dar_ejemplo_gramatical", "traducir_palabra").
-*   **Escalabilidad:**
-    *   Explorar el escalado horizontal del servidor Node.js (ej. con Node.js `cluster` o contenedores).
-
----
-
-¡Disfruta construyendo el futuro del aprendizaje de idiomas!
-# Lingo-IA-Tu-Tutor-de-Idiomas-Inteligente-y-en-Tiempo-Real-
+Este enfoque de testing en múltiples capas garantiza la robustez, consistencia y performance del sistema bajo condiciones adversas.

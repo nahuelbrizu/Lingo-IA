@@ -1,0 +1,16 @@
+# Ignore artifacts
+node_modules
+.next
+dist
+coverage
+
+# Ignore lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Ignore configs
+next.config.mjs
+
+# Ignore prisma generated files
+/prisma/generated

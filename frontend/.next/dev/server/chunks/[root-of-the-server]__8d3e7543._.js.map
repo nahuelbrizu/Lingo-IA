@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": [],
+  "sections": [
+    {"offset": {"line": 106, "column": 0}, "map": {"version":3,"sources":["file:///home/nahue/audioProject/frontend/app/api/auth/%5B...nextauth%5D/route.ts"],"sourcesContent":["// app/api/auth/[...nextauth]/route.ts\nimport NextAuth from 'next-auth';\nimport GoogleProvider from 'next-auth/providers/google';\nimport { PrismaAdapter } from '@auth/prisma-adapter';\nimport { prisma } from '@/src/lib/prisma'; // Assuming prisma service is accessible via alias\n\nimport jwt from 'jsonwebtoken';\n\n// ... (imports remain the same)\n\nexport const authOptions = {\n  adapter: PrismaAdapter(prisma),\n  providers: [\n    GoogleProvider({\n      clientId: process.env.GOOGLE_CLIENT_ID!,\n      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,\n    }),\n  ],\n  session: {\n    strategy: 'jwt',\n  },\n};\n\nconst handler = NextAuth(authOptions);\n\nexport { handler as GET, handler as POST };\n"],"names":[],"mappings":";;;;;;;;AAAA,sCAAsC;AACtC;AACA;AACA;;;;;;;;;;AAOO,MAAM,cAAc;IACzB,SAAS,IAAA,uKAAa,EAAC;IACvB,WAAW;QACT,IAAA,gKAAc,EAAC;YACb,UAAU,QAAQ,GAAG,CAAC,gBAAgB;YACtC,cAAc,QAAQ,GAAG,CAAC,oBAAoB;QAChD;KACD;IACD,SAAS;QACP,UAAU;IACZ;AACF;AAEA,MAAM,UAAU,IAAA,kJAAQ,EAAC"}}]
+}
