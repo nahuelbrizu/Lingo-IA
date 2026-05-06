@@ -95,3 +95,4 @@ La validación de esta arquitectura se basa en un "Test Harness" de grado de pro
 - **Tests de Performance (`BargeIn.perf.test.ts`):** Un test automatizado mide la latencia de "barge-in" desde la detección de voz hasta la parada del audio. Calcula métricas como el promedio y el **percentil 95 (p95)** y falla el pipeline de CI/CD si no se cumple el Objetivo de Nivel de Servicio (SLO) definido (ej. p95 < 100ms).
 
 Este enfoque de testing en múltiples capas garantiza la robustez, consistencia y performance del sistema bajo condiciones adversas.
+# audioProject
