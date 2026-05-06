@@ -1,11 +1,12 @@
+import { vi, describe, it, expect, afterEach } from 'vitest';
 import { GET } from '../route';
 import { getServerSession } from 'next-auth';
-import { getUserData } from '../../../../lib/db';
+import { getUserData } from '../../lib/db'; // Nueva ruta
 import { NextResponse } from 'next/server';
 
 // Mock dependencies
 vi.mock('next-auth');
-vi.mock('../../../../lib/db');
+vi.mock('../../lib/db');
 
 describe('GET /api/user', () => {
   afterEach(() => {

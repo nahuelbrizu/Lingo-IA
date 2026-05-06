@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import { audioOutputManager } from '@/app/services/AudioOutputManager';
 
 // ==================================================================
 // 1. TIPOS Y CONSTANTES
@@ -29,8 +31,9 @@ export type ConversationState =
 export type ServerMessage =
   | { type: 'user_interim'; text: string }
   | { type: 'user_final'; text: string }
-  | { type: 'ai_delta'; text: string }
-  | { type: 'ai_final' }
+  | { type: 'ai_delta'; text: string; generationId: string }
+  | { type: 'ai_audio_chunk'; chunk: string; generationId: string }
+  | { type: 'ai_final'; generationId: string }
   | { type: 'error'; message: string };
 
 /**
@@ -40,6 +43,17 @@ export type ServerMessage =
 export interface ChatMessage {
   sender: 'user' | 'ai';
   text: string;
+}
+
+// --- Helper Functions ---
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
 // --- Constantes de configuración ---
@@ -61,348 +75,225 @@ const AI_TEXT_THROTTLE_MS = 50;
 // ==================================================================
 
 export const useAudioStreaming = (authToken: string | null) => {
-  // --- Estados de React ---
-  // Estados que, al cambiar, DEBEN provocar un re-render de la UI.
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [lastUserTranscript, setLastUserTranscript] = useState('');
   const [currentVolume, setCurrentVolume] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
 
-  // --- Referencias de React ---
-  // Se usan para almacenar valores que no deben disparar re-renders al cambiar.
-  // Es clave para el rendimiento y para mantener instancias de objetos (WebSocket, etc.).
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const analyserNodeRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-
-  // Referencias para la lógica de negocio
   const reconnectAttemptsRef = useRef(0);
   const silenceSinceRef = useRef<number | null>(null);
   const aiResponseBufferRef = useRef('');
   const lastUiUpdateTimeRef = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
+  const generationIdRef = useRef<string | null>(null);
 
-  /**
-   * @description
-   * Función centralizada de limpieza. Se asegura de que todos los recursos
-   * (streams, sockets, timers) se liberen correctamente para evitar memory leaks.
-   * Es idempotente, lo que significa que se puede llamar varias veces sin efectos secundarios.
-   */
   const cleanup = useCallback(() => {
     console.log('[Cleanup] Realizando limpieza completa...');
-
-    // Detener bucle de análisis de volumen
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-
-    // Detener MediaRecorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-
-    // Detener tracks de audio del micrófono
+    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
-
-    // Cerrar AudioContext
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close();
-    }
-
-    // Cerrar WebSocket de forma segura
+    if (audioContextRef.current?.state !== 'closed') audioContextRef.current?.close();
+    if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
     if (wsRef.current) {
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        // Señal explícita de fin de sesión antes de cerrar
-        wsRef.current.send(JSON.stringify({ type: 'session_end' }));
-      }
-      wsRef.current.onclose = null; // Evitar que se dispare la lógica de reconexión
-      wsRef.current.onerror = null;
-      wsRef.current.onmessage = null;
-      wsRef.current.onopen = null;
-      if (wsRef.current.readyState < WebSocket.CLOSING) {
+        wsRef.current.onclose = null;
         wsRef.current.close();
-      }
     }
-
-    // Reiniciar referencias
-    mediaRecorderRef.current = null;
-    mediaStreamRef.current = null;
-    audioContextRef.current = null;
     wsRef.current = null;
+    audioContextRef.current = null;
+    mediaStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    animationFrameRef.current = null;
   }, []);
 
-  /**
-   * @description
-   * Maneja los mensajes entrantes del servidor.
-   * La lógica está contenida aquí para mantener limpio el manejador de `onmessage`.
-   */
-  const handleServerMessage = useCallback((event: MessageEvent) => {
-    let message: ServerMessage;
-    try {
-      message = JSON.parse(event.data);
-    } catch (error) {
-      console.error('[WebSocket] Error al parsear mensaje del servidor:', error);
-      setConversationState('error');
-      setErrorMessage('Mensaje inválido del servidor.');
-      return;
-    }
-
-    switch (message.type) {
-      case 'user_interim':
-        setLastUserTranscript(message.text + '...');
-        break;
-
-      case 'user_final':
-        setConversationState('processing');
-        setLastUserTranscript(message.text);
-        setChatMessages(prev => [...prev, { sender: 'user', text: message.text }]);
-        break;
-
-      case 'ai_delta':
-        if (conversationState !== 'ai_speaking') {
-          setConversationState('ai_speaking');
-          setChatMessages(prev => [...prev, { sender: 'ai', text: '' }]);
-        }
-        aiResponseBufferRef.current += message.text;
-        break;
-
-      case 'ai_final':
-        // La respuesta final de la IA resetea el buffer y nos prepara para escuchar de nuevo.
-        setConversationState('listening');
-        aiResponseBufferRef.current = '';
-        silenceSinceRef.current = null; // Reiniciar VAD
-        break;
-
-      case 'error':
-        setConversationState('error');
-        setErrorMessage(message.message);
-        cleanup();
-        break;
-    }
-  }, [cleanup, conversationState]);
-
-  /**
-   * @description
-   * Actualiza la UI con el texto acumulado de la IA de forma eficiente.
-   * Utiliza throttling para evitar re-renders excesivos en cada token recibido,
-   * lo cual es crucial para el rendimiento.
-   */
-  const throttledUiUpdate = useCallback(() => {
-    const now = Date.now();
-    if (now - lastUiUpdateTimeRef.current > AI_TEXT_THROTTLE_MS && aiResponseBufferRef.current) {
-      setChatMessages(prev => {
-        const newMessages = [...prev];
-        const lastMessage = newMessages[newMessages.length - 1];
-        if (lastMessage && lastMessage.sender === 'ai') {
-          lastMessage.text = aiResponseBufferRef.current;
-        }
-        return newMessages;
-      });
-      lastUiUpdateTimeRef.current = now;
-    }
-  }, []);
-
-  /**
-   * @description
-   * Bucle de análisis de audio que se ejecuta con requestAnimationFrame.
-   * Calcula el volumen (RMS) y gestiona la detección de silencio (VAD).
-   */
   const analyseAudio = useCallback(() => {
-    if (!analyserNodeRef.current) {
-      return;
-    }
-
-    const bufferLength = analyserNodeRef.current.fftSize;
-    const dataArray = new Float32Array(bufferLength);
+    if (!analyserNodeRef.current) return;
+    const dataArray = new Float32Array(analyserNodeRef.current.fftSize);
     analyserNodeRef.current.getFloatTimeDomainData(dataArray);
-
-    // --- Cálculo de RMS (Root Mean Square) ---
-    // Es una medida más precisa del "volumen" o "potencia" de la señal que un promedio simple.
     let sumOfSquares = 0;
-    for (let i = 0; i < bufferLength; i++) {
+    for (let i = 0; i < dataArray.length; i++) {
       sumOfSquares += dataArray[i] * dataArray[i];
     }
-    const rms = Math.sqrt(sumOfSquares / bufferLength);
+    const rms = Math.sqrt(sumOfSquares / dataArray.length);
     setCurrentVolume(rms);
 
-    // --- Lógica de VAD (Voice Activity Detection) ---
-    if (conversationState === 'listening') {
-      if (rms > VAD_RMS_THRESHOLD) {
-        // Hay sonido, reseteamos el contador de silencio.
-        silenceSinceRef.current = null;
-      } else {
-        // No hay sonido, empezamos a contar.
+    const currentState = conversationStateRef.current; // Usar ref para el estado
+
+    if (rms > VAD_RMS_THRESHOLD) {
+      silenceSinceRef.current = null;
+      if (currentState === 'ai_speaking') {
+        console.log('[Barge-in] User interruption detected.');
+        if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
+        if (wsRef.current && generationIdRef.current) {
+          wsRef.current.send(JSON.stringify({ type: 'barge_in', generationId: generationIdRef.current }));
+        }
+        aiResponseBufferRef.current = '';
+        setConversationState('listening');
+      }
+    } else {
+      if (currentState === 'listening') {
         if (!silenceSinceRef.current) {
           silenceSinceRef.current = Date.now();
         } else if (Date.now() - silenceSinceRef.current > VAD_SILENCE_DURATION_MS) {
-          // Si el silencio supera la duración definida, el usuario terminó de hablar.
-          console.log('[VAD] Silencio detectado, finalizando turno de usuario.');
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            mediaRecorderRef.current.stop(); // Esto enviará el último chunk de audio
-            mediaRecorderRef.current.start(250); // Reiniciar para el proximo turno
+          console.log('[VAD] Silence detected, ending user turn.');
+          if (mediaRecorderRef.current?.state === 'recording') {
+            mediaRecorderRef.current.stop();
+            mediaRecorderRef.current.start(250);
           }
           setConversationState('processing');
         }
       }
     }
-
     animationFrameRef.current = requestAnimationFrame(analyseAudio);
+  }, []);
+
+  const conversationStateRef = useRef(conversationState);
+  useEffect(() => {
+    conversationStateRef.current = conversationState;
   }, [conversationState]);
 
-  /**
-   * @description Inicializa el MediaRecorder para grabar el audio del micrófono.
-   */
   const initRecorder = useCallback(() => {
     if (!mediaStreamRef.current || !wsRef.current) return;
-
-    mediaRecorderRef.current = new MediaRecorder(mediaStreamRef.current, {
-      mimeType: 'audio/webm;codecs=opus'
-    });
-
+    mediaRecorderRef.current = new MediaRecorder(mediaStreamRef.current, { mimeType: 'audio/webm;codecs=opus' });
     mediaRecorderRef.current.ondataavailable = (event) => {
-      // --- Control de Backpressure ---
-      // Si el buffer del WebSocket está lleno, no enviamos más datos para no saturar la conexión.
       if (wsRef.current && wsRef.current.bufferedAmount > WEBSOCKET_BUFFER_THRESHOLD) {
-        console.warn('[Backpressure] Límite de buffer del WebSocket superado. Pausando envío.');
         return;
       }
-
       if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(event.data);
       }
     };
-
-    mediaRecorderRef.current.start(250); // Enviar chunks de audio cada 250ms
+    mediaRecorderRef.current.start(250);
   }, []);
 
-  /**
-   * @description Pide permiso al usuario e inicializa el stream del micrófono y el AudioContext.
-   */
   const initMicrophone = useCallback(async () => {
     try {
       mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // --- Manejo de AudioContext ---
-      // Se crea una sola vez y se reutiliza. Se maneja el estado 'suspended' que
-      // ocurre en algunos navegadores por políticas de autoplay.
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      }
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       if (audioContextRef.current.state === 'suspended') {
         await audioContextRef.current.resume();
       }
-
-      const sourceNode = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
+      const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
       analyserNodeRef.current = audioContextRef.current.createAnalyser();
       analyserNodeRef.current.fftSize = 2048;
-      sourceNode.connect(analyserNodeRef.current);
-
+      source.connect(analyserNodeRef.current);
       initRecorder();
       animationFrameRef.current = requestAnimationFrame(analyseAudio);
-
     } catch (error: any) {
-      console.error('[Microphone] Error al obtener acceso al micrófono:', error);
-      let userMessage = 'No se pudo acceder al micrófono.';
-      if (error.name === 'NotAllowedError') {
-        userMessage = 'Permiso para micrófono denegado. Revíselo en la configuración de su navegador.';
-      } else if (error.name === 'NotFoundError') {
-        userMessage = 'No se encontró ningún micrófono conectado.';
-      }
-      setErrorMessage(userMessage);
+      setErrorMessage(error.name === 'NotAllowedError' ? 'Microphone permission denied.' : 'No microphone found.');
       setConversationState('error');
       cleanup();
     }
   }, [analyseAudio, cleanup, initRecorder]);
 
-  /**
-   * @description Establece la conexión WebSocket y define sus manejadores de eventos.
-   */
+  const handleServerMessage = useCallback((event: MessageEvent) => {
+    const message: ServerMessage = JSON.parse(event.data);
+    if ('generationId' in message && message.generationId !== generationIdRef.current) {
+      generationIdRef.current = message.generationId;
+      aiResponseBufferRef.current = '';
+    }
+    switch (message.type) {
+      case 'user_interim': setLastUserTranscript(message.text + '...'); break;
+      case 'user_final':
+        setConversationState('processing');
+        setLastUserTranscript(message.text);
+        setChatMessages(prev => [...prev, { sender: 'user', text: message.text }]);
+        break;
+      case 'ai_delta':
+        if (conversationStateRef.current !== 'ai_speaking') {
+          setConversationState('ai_speaking');
+          setChatMessages(prev => [...prev, { sender: 'ai', text: '' }]);
+        }
+        aiResponseBufferRef.current += message.text;
+        break;
+      case 'ai_audio_chunk':
+        if (sessionIdRef.current && generationIdRef.current) {
+          const audioChunk = base64ToArrayBuffer(message.chunk);
+          audioOutputManager.play({ chunk: audioChunk, sessionId: sessionIdRef.current, generationId: generationIdRef.current });
+        }
+        break;
+      case 'ai_final':
+        setConversationState('listening');
+        aiResponseBufferRef.current = '';
+        silenceSinceRef.current = null;
+        break;
+      case 'error':
+        setErrorMessage(message.message);
+        setConversationState('error');
+        cleanup();
+        break;
+    }
+  }, [cleanup]);
+
   const connectWebSocket = useCallback(() => {
     if (!authToken) {
-      console.error('[WebSocket] Token de autenticación no proporcionado.');
-      setErrorMessage('Autenticación requerida.');
+      setErrorMessage('Authentication required.');
       setConversationState('error');
       return;
     }
-
-    cleanup(); // Limpieza previa por si hay una conexión anterior.
-
+    cleanup();
     const url = `${process.env.NEXT_PUBLIC_WEBSOCKET_URL}?token=${authToken}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
     setConversationState('connecting');
-
     ws.onopen = () => {
-      console.log('[WebSocket] Conexión establecida.');
+      console.log('[WebSocket] Connection established.');
       setConversationState('listening');
-      reconnectAttemptsRef.current = 0; // Reiniciar contador de reconexión
+      reconnectAttemptsRef.current = 0;
       initMicrophone();
     };
-
     ws.onmessage = handleServerMessage;
-
-    ws.onerror = (error) => {
-      console.error('[WebSocket] Error en la conexión:', error);
-      setErrorMessage('Error de conexión.');
-      setConversationState('error');
-    };
-
+    ws.onerror = () => { setErrorMessage('Connection error.'); setConversationState('error'); };
     ws.onclose = (event) => {
-      // --- Lógica de Reconexión con Backoff Exponencial ---
-      // Si la conexión se cierra inesperadamente (código 1006), intentamos reconectar.
       if (event.code === 1006) {
-        console.warn(`[WebSocket] Conexión cerrada inesperadamente. Intentando reconectar...`);
-        const delay = Math.min(
-          MAX_RECONNECT_DELAY,
-          (2 ** reconnectAttemptsRef.current) * 1000
-        );
+        const delay = Math.min(MAX_RECONNECT_DELAY, (2 ** reconnectAttemptsRef.current) * 1000);
         setTimeout(() => {
           reconnectAttemptsRef.current++;
           connectWebSocket();
         }, delay);
       } else {
-        console.log('[WebSocket] Conexión cerrada limpiamente.');
-        if (conversationState !== 'idle') {
-          setConversationState('idle');
-        }
+        setConversationState('idle');
       }
     };
-  }, [authToken, cleanup, handleServerMessage, initMicrophone, conversationState]);
+  }, [authToken, cleanup, initMicrophone, handleServerMessage]);
 
-  // --- Funciones de control expuestas por el hook ---
-
-  /**
-   * @description Inicia todo el proceso de la conversación.
-   */
   const startConversation = useCallback(() => {
-    if (conversationState === 'idle') {
+    if (conversationStateRef.current === 'idle') {
+      sessionIdRef.current = uuidv4();
       setChatMessages([]);
       setLastUserTranscript('');
       setErrorMessage('');
       connectWebSocket();
     }
-  }, [conversationState, connectWebSocket]);
+  }, [connectWebSocket]);
 
-  /**
-   * @description Detiene la conversación y realiza una limpieza completa.
-   */
   const stopConversation = useCallback(() => {
     setConversationState('idle');
     cleanup();
   }, [cleanup]);
 
-  // --- Efecto de limpieza ---
-  // Se asegura de que todo se limpie cuando el componente que usa el hook se desmonte.
-  useEffect(() => {
-    return cleanup;
-  }, [cleanup]);
+  useEffect(() => cleanup, [cleanup]);
 
-  // --- Efecto para el throttling de la UI ---
-  // Este efecto gestiona el bucle de actualización para el texto de la IA.
+  const throttledUiUpdate = useCallback(() => {
+    if (Date.now() - lastUiUpdateTimeRef.current > AI_TEXT_THROTTLE_MS && aiResponseBufferRef.current) {
+      setChatMessages(prev => {
+        const newMessages = [...prev];
+        const lastMessage = newMessages[newMessages.length - 1];
+        if (lastMessage?.sender === 'ai') {
+          lastMessage.text = aiResponseBufferRef.current;
+        }
+        return newMessages;
+      });
+      lastUiUpdateTimeRef.current = Date.now();
+    }
+  }, []);
+
   useEffect(() => {
     if (conversationState === 'ai_speaking') {
       const intervalId = setInterval(throttledUiUpdate, AI_TEXT_THROTTLE_MS);
@@ -410,22 +301,13 @@ export const useAudioStreaming = (authToken: string | null) => {
     }
   }, [conversationState, throttledUiUpdate]);
 
-
-  // ==================================================================
-  // 3. VALORES DE RETORNO
-  // ==================================================================
   return {
-    // --- Estado ---
     conversationState,
     chatMessages,
     lastUserTranscript,
     errorMessage,
-
-    // --- Controles ---
     startConversation,
     stopConversation,
-
-    // --- Datos en tiempo real ---
-    currentVolume, // Puede usarse para visualizaciones
+    currentVolume,
   };
 };

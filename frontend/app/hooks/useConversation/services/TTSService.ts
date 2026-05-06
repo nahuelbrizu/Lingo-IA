@@ -45,14 +45,14 @@ export class TTSService {
           sessionId: this.sessionId,
           generationId,
           payload: { chunk },
-        });
+        } as any);
       }
 
       globalEventBus.publish({
         type: 'TTS_STREAM_ENDED',
         sessionId: this.sessionId,
         generationId,
-      });
+      } as any);
 
     } catch (error) {
       // ... manejo de errores

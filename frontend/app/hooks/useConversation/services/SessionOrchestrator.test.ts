@@ -2,15 +2,17 @@
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { SessionOrchestrator } from './SessionOrchestrator';
-import { audioInputManager } from '../../../services/AudioInputManager';
-import { audioOutputManager } from '../../../services/AudioOutputManager';
-import { ttsService } from './TTSService'; // Suponiendo una instancia mockeable
+import { audioInputManager } from '@/app/services/AudioInputManager';
+import { audioOutputManager } from '@/app/services/AudioOutputManager';
+import { TTSService } from './TTSService';
 import { GlobalEvent } from '../types';
 
 // Mock de los módulos de servicio
-vi.mock('../../../services/AudioInputManager');
-vi.mock('../../../services/AudioOutputManager');
+vi.mock('@/app/services/AudioInputManager');
+vi.mock('@/app/services/AudioOutputManager');
 vi.mock('./TTSService');
+
+const ttsService = new TTSService('session-id') as vi.Mocked<TTSService>;
 
 describe('SessionOrchestrator Integration & Race Conditions', () => {
   let orchestrator: SessionOrchestrator;
@@ -37,17 +39,17 @@ describe('SessionOrchestrator Integration & Race Conditions', () => {
     // Aquí se llamaría al mock de llmService.send(...)
 
     // 3. LLM termina, empieza TTS
-    const llmResponse = { type: 'LLM_STREAM_ENDED', sessionId, generationId: 'gen-1', payload: { fullText: 'Hola' }, timestamp: Date.now() };
+    const llmResponse: GlobalEvent = { type: 'LLM_STREAM_ENDED', sessionId, generationId: 'gen-1', payload: { fullText: 'Hola' }, timestamp: Date.now() };
     orchestrator.processEvent(llmResponse);
-    expect(ttsService.generate).toHaveBeenCalledWith('Hola', expect.any(String));
+    expect(ttsService.generate).toHaveBeenCalledWith('Hola', 'gen-1');
 
     // 4. TTS devuelve el primer chunk
-    const ttsChunk = { type: 'TTS_AUDIO_CHUNK_RECEIVED', sessionId, generationId: orchestrator['activeGenerationId'], payload: { chunk: new ArrayBuffer(8) }, timestamp: Date.now() };
+    const ttsChunk: GlobalEvent = { type: 'TTS_AUDIO_CHUNK_RECEIVED', sessionId, generationId: 'gen-1', payload: { chunk: new ArrayBuffer(8) }, timestamp: Date.now() };
     orchestrator.processEvent(ttsChunk);
-    expect(audioOutputManager.play).toHaveBeenCalledWith(expect.objectContaining({ sessionId, generationId: orchestrator['activeGenerationId'] }));
+    expect(audioOutputManager.play).toHaveBeenCalledWith(expect.objectContaining({ sessionId, generationId: 'gen-1' }));
     
     // 5. El audio termina
-    const playbackEnd = { type: 'AUDIO_PLAYBACK_FINISHED', sessionId, generationId: orchestrator['activeGenerationId'], timestamp: Date.now() };
+    const playbackEnd: GlobalEvent = { type: 'AUDIO_PLAYBACK_FINISHED', sessionId, generationId: 'gen-1', timestamp: Date.now() };
     orchestrator.processEvent(playbackEnd);
     expect(orchestrator['state'].status).toBe('listening');
   });
@@ -65,7 +67,6 @@ describe('SessionOrchestrator Integration & Race Conditions', () => {
     // Verificar que se llamaron todos los comandos de cancelación
     expect(ttsService.cancel).toHaveBeenCalledWith(activeGenId);
     expect(audioOutputManager.stop).toHaveBeenCalledWith(sessionId);
-    // expect(llmService.cancel).toHaveBeenCalledWith(activeGenId);
     
     // Verificar que la generación se invalidó
     expect(orchestrator['activeGenerationId']).toBeNull();
@@ -91,8 +92,6 @@ describe('SessionOrchestrator Integration & Race Conditions', () => {
     };
     orchestrator.processEvent(lateChunkEvent);
 
-    // La FSM no debería procesar este evento, por lo que no se emitirá un comando de play.
-    // isValidGeneration devolvería false, y el evento sería ignorado.
     expect(audioOutputManager.play).not.toHaveBeenCalled();
   });
 });

@@ -5,7 +5,7 @@ import { SessionInstance } from './SessionInstance';
 import { GlobalEvent, ISession, SessionConfig } from './types';
 import { audioInputManager } from '../../services/AudioInputManager';
 import { audioOutputManager } from '../../services/AudioOutputManager';
-import { globalEventBus } from '../../services/EventBus'; // Asumiendo que el EventBus está aquí
+import { globalEventBus } from '../../services/EventBus';
 
 // --- Constantes de Inactividad ---
 const ACTIVITY_CHECK_INTERVAL_MS = 60 * 1000; // Cada 1 minuto
@@ -22,8 +22,9 @@ const SESSION_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos de inactivid
 class SessionManager {
   private static instance: SessionManager;
   private sessions: Map<string, ISession> = new Map();
-  private activeListeningSessionId: string | null = null;
   private activityCheckInterval: NodeJS.Timeout | null = null;
+  // Foco de Audio (en una implementación más avanzada, no se usa aquí)
+  // private activeListeningSessionId: string | null = null;
 
   private constructor() {
     this.subscribeToGlobalEvents();
@@ -37,56 +38,94 @@ class SessionManager {
     return SessionManager.instance;
   }
 
-  /**
-   * Se suscribe al EventBus global para escuchar todos los eventos del sistema
-   * y enrutarlos a la instancia de sesión correcta.
-   */
   private subscribeToGlobalEvents(): void {
     globalEventBus.subscribe('SessionManager', (event: GlobalEvent) => {
       // Enrutar eventos con sessionId a la sesión correcta
       if (event.sessionId && this.sessions.has(event.sessionId)) {
         this.getSession(event.sessionId)?.handleEvent(event);
-      } else if (event.sessionId) {
-        // Si un evento dirigido a una sesión llega, pero la sesión no existe (ya destruida),
-        // simplemente lo ignoramos. Esto es un fail-safe.
-        // console.warn(`[SessionManager] Evento para sesión inexistente ${event.sessionId}: ${event.type}. Descartado.`);
+      } else if (!event.sessionId) {
+        // Eventos de broadcast (como VAD) se envían a todas las sesiones activas
+        this.sessions.forEach(session => session.handleEvent(event));
       }
-      // Eventos sin sessionId (ej. VAD_SPEECH_DETECTED) serían gestionados directamente por el orchestrator
-      // o reenviados a todas las sesiones en un flujo de broadcast controlado (fuera del scope de este enrutador básico).
     });
     console.log('[SessionManager] Singleton inicializado y listo para enrutar eventos.');
   }
-
-  /**
-   * Inicia el monitoreo periódico de sesiones inactivas para limpiarlas automáticamente.
-   */
+  
   private startActivityMonitor(): void {
-    if (this.activityCheckInterval) return; // Ya está activo
+    if (this.activityCheckInterval) return;
 
     this.activityCheckInterval = setInterval(() => {
       const now = Date.now();
       this.sessions.forEach((session, sessionId) => {
         if (now - session.lastActivityTimestamp > SESSION_INACTIVITY_TIMEOUT_MS) {
-          console.log(`[SessionManager] Sesión ${sessionId} inactiva por mucho tiempo. Destruyendo automáticamente.`);
-          this.destroySession(sessionId); // Usamos el método de destrucción que limpia todos los recursos
+          console.log(`[SessionManager] Sesión ${sessionId} inactiva. Destruyendo automáticamente.`);
+          this.destroySession(sessionId);
         }
       });
     }, ACTIVITY_CHECK_INTERVAL_MS);
-    console.log(`[SessionManager] Monitor de actividad iniciado (cada ${ACTIVITY_CHECK_INTERVAL_MS / 1000}s).`);
   }
-
-  /**
-   * Detiene el monitoreo de actividad. Útil si el SessionManager tuviera un ciclo de vida propio.
-   */
+  
   public stopActivityMonitor(): void {
     if (this.activityCheckInterval) {
       clearInterval(this.activityCheckInterval);
       this.activityCheckInterval = null;
-      console.log('[SessionManager] Monitor de actividad detenido.');
     }
   }
 
-  // ... MÉTODOS DE GESTIÓN DE FOCO ...
+  // ==================================================================
+  // MÉTODOS DE CICLO DE VIDA (API Pública)
+  // ==================================================================
 
-  // ... MÉTODOS DE CICLO DE VIDA (createSession, getSession, destroySession, getActiveSessionCount) ...
+  /**
+   * Crea, registra y devuelve una nueva instancia de sesión.
+   * @param config - La configuración para la nueva sesión.
+   * @returns La instancia de ISession creada.
+   */
+  public createSession(config: SessionConfig): ISession {
+    const sessionId = uuidv4();
+    const newSession = new SessionInstance(sessionId, config);
+    this.sessions.set(sessionId, newSession);
+    console.log(`[SessionManager] Nueva sesión creada: ${sessionId}. Sesiones activas: ${this.sessions.size}`);
+    
+    // Aquí es donde se podría gestionar el "foco" del micrófono si solo una sesión puede escuchar a la vez.
+    // Por ahora, AudioInputManager lo gestiona con un contador de referencias.
+    
+    return newSession;
+  }
+
+  /**
+   * Obtiene una sesión por su ID.
+   * @param sessionId - El ID de la sesión.
+   * @returns La instancia de ISession o undefined si no se encuentra.
+   */
+  public getSession(sessionId: string): ISession | undefined {
+    return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Destruye una sesión, liberando todos sus recursos.
+   * @param sessionId - El ID de la sesión a destruir.
+   */
+  public destroySession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.cleanup(); // Fundamental para liberar recursos internos de la sesión
+      this.sessions.delete(sessionId);
+      console.log(`[SessionManager] Sesión destruida: ${sessionId}. Sesiones activas: ${this.sessions.size}`);
+      
+      // Detener cualquier reproducción de audio que pudiera haber quedado de esa sesión
+      audioOutputManager.stop(sessionId);
+    }
+  }
+
+  /**
+   * Devuelve el número de sesiones activas.
+   * @returns El número de sesiones.
+   */
+  public getActiveSessionCount(): number {
+    return this.sessions.size;
+  }
 }
+
+// Exportar la instancia singleton para ser usada en toda la aplicación
+export const sessionManager = SessionManager.getInstance();

@@ -1,8 +1,9 @@
 // frontend/app/hooks/useConversation/StressTest.test.ts
 
 import { vi, describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { sessionManager } from '../SessionManager';
-import { SessionInstance } from '../SessionInstance';
+import { sessionManager } from './SessionManager';
+import { SessionInstance } from './SessionInstance';
+import { ISession } from './types';
 import { 
   mockEventBus, 
   mockLlmService, 
@@ -17,11 +18,11 @@ const CONCURRENT_SESSIONS = 100;
 const BARGE_IN_PROBABILITY = 0.3; // 30% de probabilidad de interrupción
 
 // --- Mockear todos los servicios globales y el EventBus ---
-vi.mock('../../services/EventBus', () => ({ globalEventBus: mockEventBus }));
+vi.mock('../services/EventBus', () => ({ globalEventBus: mockEventBus }));
 vi.mock('./services/LLMService', () => ({ llmService: mockLlmService }));
 vi.mock('./services/TTSService', () => ({ ttsService: mockTtsService }));
-vi.mock('../../services/AudioOutputManager', () => ({ audioOutputManager: mockAudioOutputManager }));
-vi.mock('../../services/AudioInputManager', () => ({ audioInputManager: mockAudioInputManager }));
+vi.mock('../services/AudioOutputManager', () => ({ audioOutputManager: mockAudioOutputManager }));
+vi.mock('../services/AudioInputManager', () => ({ audioInputManager: mockAudioInputManager }));
 
 describe('Stress Test: Multi-Session Conversation Engine', () => {
 
@@ -29,7 +30,7 @@ describe('Stress Test: Multi-Session Conversation Engine', () => {
     // Suscribir el SessionManager real a nuestro bus mockeado para interceptar y controlar el flujo
     const sm = sessionManager as any;
     sm.subscribeToGlobalEvents = () => {
-      mockEventBus.subscribe('SessionManager', (event) => {
+      mockEventBus.subscribe('SessionManager', (event: any) => {
         const session = sm.getSession(event.sessionId);
         session?.handleEvent(event);
       });
@@ -39,7 +40,7 @@ describe('Stress Test: Multi-Session Conversation Engine', () => {
 
   afterAll(() => {
     // Limpieza final
-    sessionManager['sessions'].forEach(session => sessionManager.destroySession(session.id));
+    (sessionManager as any)['sessions'].forEach((session: ISession) => sessionManager.destroySession(session.id));
   });
 
   it(`should handle ${CONCURRENT_SESSIONS} concurrent sessions with random barge-in without inconsistencies`, async () => {

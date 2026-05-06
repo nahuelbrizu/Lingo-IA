@@ -18,8 +18,14 @@ class AudioInputManager {
 
   private audioContext: AudioContext | null = null;
   private stream: MediaStream | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
   private workletNode: AudioWorkletNode | null = null;
-  // ... VAD y otros nodos de análisis.
+  
+  // --- Estado interno de VAD ---
+  private readonly VAD_RMS_THRESHOLD = 0.02; // Sensibilidad (0.0 a 1.0)
+  private readonly VAD_SILENCE_DURATION_MS = 800; // MS de silencio para terminar turno
+  private isSpeaking = false;
+  private silenceStartTimestamp: number | null = null;
 
   private constructor() {}
 
@@ -57,26 +63,84 @@ class AudioInputManager {
     }
   }
 
+  private processVAD(pcmData: Int16Array) {
+    // 1. Calcular RMS para obtener el nivel de volumen
+    let sumOfSquares = 0;
+    for (let i = 0; i < pcmData.length; i++) {
+      // Normalizamos el valor de Int16 (-32768 a 32767) al rango -1.0 a 1.0
+      const normalizedValue = pcmData[i] / 32768.0;
+      sumOfSquares += normalizedValue * normalizedValue;
+    }
+    const rms = Math.sqrt(sumOfSquares / pcmData.length);
+
+    // 2. Despachar eventos VAD a nivel de aplicación (EventBus)
+    const now = Date.now();
+
+    if (rms > this.VAD_RMS_THRESHOLD) {
+      if (!this.isSpeaking) {
+        this.isSpeaking = true;
+        // Evento crítico para cancelar el habla de la IA (Barge-in)
+        globalEventBus.publish({ type: 'VAD_SPEECH_DETECTED' });
+      }
+      // Si el usuario está hablando, reseteamos el temporizador de silencio
+      this.silenceStartTimestamp = null;
+    } else {
+      if (this.isSpeaking) {
+        if (!this.silenceStartTimestamp) {
+          this.silenceStartTimestamp = now;
+        } else if (now - this.silenceStartTimestamp > this.VAD_SILENCE_DURATION_MS) {
+          // El silencio se mantuvo el tiempo suficiente, el usuario terminó de hablar
+          this.isSpeaking = false;
+          this.silenceStartTimestamp = null;
+          globalEventBus.publish({ type: 'VAD_SILENCE_DETECTED' });
+        }
+      }
+    }
+    
+    // (Opcional) Podemos publicar el volumen si necesitamos visualizaciones globales UI
+    // globalEventBus.publish({ type: 'AUDIO_VOLUME', payload: { rms } });
+  }
+
   private async startMicrophone(): Promise<void> {
     if (this.stream) return;
 
-    console.log('[AudioInputManager] Iniciando captura de micrófono (1 suscriptor)...');
+    console.log('[AudioInputManager] Iniciando captura de micrófono...');
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 16000 // Aseguramos un sample rate estable compatible
+      });
       
-      // Asumiendo que el worklet está en `public/audio.worklet.js`
-      // await this.audioContext.audioWorklet.addModule('/audio.worklet.js');
-      // this.workletNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
+      // Manejar el autoplay policy (algunos navegadores inician suspendidos)
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
+      
+      this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
+      
+      // Cargar el worklet del thread paralelo de audio
+      await this.audioContext.audioWorklet.addModule('/audio-processor.js');
+      this.workletNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
+      
+      // Conectar el nodo de origen al worklet. No lo conectamos a 'destination' para evitar eco.
+      this.sourceNode.connect(this.workletNode);
       
       // Conexión del despacho directo
-      // this.workletNode.port.onmessage = (event: MessageEvent<Int16Array>) => {
-      //   this.audioSubscribers.forEach(callback => callback(event.data));
-      // };
+      this.workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+        const pcmData = new Int16Array(event.data);
+        console.log(`[AudioInputManager] Chunk de audio recibido, size: ${pcmData.length}`); // <-- LOG
+        
+        // 1. Publicar a los suscriptores activos (los orchestrators de sesión)
+        this.audioSubscribers.forEach(callback => callback(pcmData));
+
+        // 2. Procesar el análisis de actividad de voz y barge-in
+        this.processVAD(pcmData);
+      };
       
-      // Los eventos de VAD de bajo volumen siguen siendo útiles globalmente para barge-in
-      // y pueden seguir publicándose en el bus global.
+      this.isSpeaking = false;
+      this.silenceStartTimestamp = null;
       
+      console.log('[AudioInputManager] Micrófono iniciado y worklet conectado.'); // <-- LOG
       globalEventBus.publish({ type: 'AUDIO_INPUT_STARTED' });
 
     } catch (error) {
@@ -89,14 +153,25 @@ class AudioInputManager {
   private stopMicrophone(): void {
     if (!this.stream) return;
 
-    console.log('[AudioInputManager] Deteniendo captura de micrófono (0 suscriptores)...');
-    this.stream.getTracks().forEach(track => track.stop());
-    this.audioContext?.close().catch(console.error);
+    console.log('[AudioInputManager] Deteniendo captura de micrófono...');
+    
+    // Desconectar nodos
+    this.sourceNode?.disconnect();
+    this.workletNode?.disconnect();
     this.workletNode?.port.close();
+
+    // Detener pistas del Stream
+    this.stream.getTracks().forEach(track => track.stop());
+    
+    // Cerrar el contexto de audio
+    this.audioContext?.close().catch(console.error);
 
     this.stream = null;
     this.audioContext = null;
+    this.sourceNode = null;
     this.workletNode = null;
+    this.isSpeaking = false;
+    this.silenceStartTimestamp = null;
     
     globalEventBus.publish({ type: 'AUDIO_INPUT_STOPPED' });
   }

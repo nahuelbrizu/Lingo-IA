@@ -34,7 +34,16 @@ class AudioOutputManager {
   }
 
   private getContext(): AudioContext {
-    // ... (sin cambios)
+    if (!this.audioContext) {
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    // Si el contexto está suspendido (políticas de autoplay), intentamos reanudarlo
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume().catch(err => {
+        console.warn('[AudioOutputManager] No se pudo reanudar el AudioContext automáticamente:', err);
+      });
+    }
+    return this.audioContext;
   }
 
   public async play(request: PlaybackRequest): Promise<void> {

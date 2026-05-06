@@ -143,11 +143,13 @@ var __turbopack_async_dependencies__ = __turbopack_handle_async_dependencies__([
 ;
 ;
 const connectionString = process.env.DATABASE_URL;
+console.log(`[DB DEBUG] DATABASE_URL used (partial): ${connectionString ? connectionString.substring(0, 30) + '...' + connectionString.substring(connectionString.length - 10) : 'MISSING'}`); // TEMPORARY DEBUG LOG
 const pool = new __TURBOPACK__imported__module__$5b$externals$5d2f$pg__$5b$external$5d$__$28$pg$2c$__esm_import$2c$__$5b$project$5d2f$node_modules$2f$pg$29$__["Pool"]({
     connectionString
 });
 const adapter = new __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f40$prisma$2f$adapter$2d$pg$2f$dist$2f$index$2e$mjs__$5b$app$2d$route$5d$__$28$ecmascript$29$__["PrismaPg"](pool);
 const prisma = global.prisma || new __TURBOPACK__imported__module__$5b$externals$5d2f40$prisma$2f$client__$5b$external$5d$__$2840$prisma$2f$client$2c$__cjs$2c$__$5b$project$5d2f$node_modules$2f40$prisma$2f$client$29$__["PrismaClient"]({
+    // @ts-ignore
     adapter,
     log: [
         'query',
@@ -200,7 +202,15 @@ const authOptions = {
     providers: [
         (0, __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2d$auth$2f$providers$2f$google$2e$js__$5b$app$2d$route$5d$__$28$ecmascript$29$__["default"])({
             clientId: process.env.GOOGLE_CLIENT_ID,
-            clientSecret: process.env.GOOGLE_CLIENT_SECRET
+            clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+            profile (profile) {
+                return {
+                    id: profile.sub,
+                    name: profile.name,
+                    email: profile.email,
+                    image: profile.picture
+                };
+            }
         })
     ],
     session: {
@@ -212,6 +222,7 @@ const authOptions = {
             // We are creating a separate, short-lived JWT for WebSocket authentication.
             if (user) {
                 token.id = user.id;
+                console.log(`[AUTH DEBUG] Frontend NEXTAUTH_SECRET used for signing (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`); // TEMPORARY DEBUG LOG
                 const wsToken = __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$jsonwebtoken$2f$index$2e$js__$5b$app$2d$route$5d$__$28$ecmascript$29$__["default"].sign({
                     id: user.id
                 }, process.env.NEXTAUTH_SECRET, {

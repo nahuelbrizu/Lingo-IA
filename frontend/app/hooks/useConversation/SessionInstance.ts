@@ -1,9 +1,7 @@
 // frontend/app/hooks/useConversation/SessionInstance.ts
 
 import { GlobalEvent, ISession, SessionConfig } from './types';
-// En el futuro, estos se importarían y se instanciarían aquí.
-// import { ConversationFSM } from './ConversationFSM';
-// import { Orchestrator } from './Orchestrator';
+import { SessionOrchestrator } from './services/SessionOrchestrator';
 
 /**
  * @class SessionInstance
@@ -14,14 +12,16 @@ import { GlobalEvent, ISession, SessionConfig } from './types';
  */
 export class SessionInstance implements ISession {
   public readonly id: string;
-  public lastActivityTimestamp: number; // Añadido para el monitoreo de inactividad
+  public lastActivityTimestamp: number;
   private config: SessionConfig;
   private isActive: boolean = true;
+  private orchestrator: SessionOrchestrator;
 
   constructor(sessionId: string, config: SessionConfig) {
     this.id = sessionId;
     this.config = config;
-    this.lastActivityTimestamp = Date.now(); // Inicializar con el timestamp de creación
+    this.lastActivityTimestamp = Date.now();
+    this.orchestrator = new SessionOrchestrator(sessionId);
 
     console.log(`[SessionInstance:${this.id}] Creada con la configuración:`, config);
   }
@@ -35,34 +35,31 @@ export class SessionInstance implements ISession {
       return;
     }
 
-    // Actualizar el timestamp de actividad para el garbage collector del SessionManager
     this.lastActivityTimestamp = Date.now();
 
-    // Validación defensiva estricta contra errores de enrutamiento ("cross-talk").
-    if (event.sessionId !== this.id) {
+    // Validación defensiva contra errores de enrutamiento
+    if (event.sessionId && event.sessionId !== this.id) {
       console.error(
-        `CRITICAL: [SessionInstance:${this.id}] Recibió un evento destinado a la sesión ${event.sessionId}. ` +
-        `Esto es un bug de enrutamiento. Evento: ${event.type}.`
+        `[SessionInstance:${this.id}] Recibió un evento destinado a la sesión ${event.sessionId}. Evento: ${event.type}.`
       );
       return;
     }
     
-    // this.orchestrator.processEvent(event);
+    // Pasar el evento al orquestador para que maneje la lógica
+    this.orchestrator.processEvent(event);
   }
 
   /**
-   * Libera todos los recursos asociados a esta sesión para prevenir memory leaks.
-   * Es invocado por el SessionManager antes de que la sesión sea eliminada del registro.
+   * Libera todos los recursos asociados a esta sesión.
    */
   public cleanup(): void {
-    if (!this.isActive) return; // Evitar limpieza múltiple.
+    if (!this.isActive) return;
 
     console.log(`[SessionInstance:${this.id}] Iniciando limpieza de recursos...`);
 
-    // El orquestador se encargaría de cancelar todos los servicios activos (WebSocket, Audio, TTS).
-    // this.orchestrator.cleanup();
+    this.orchestrator.cleanup();
 
     this.isActive = false;
-    console.log(`[SessionInstance:${this.id}] Limpieza completada. La sesión está inactiva.`);
+    console.log(`[SessionInstance:${this.id}] Limpieza completada.`);
   }
 }

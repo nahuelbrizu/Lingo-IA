@@ -1,36 +1,36 @@
 // frontend/app/hooks/useConversation/services/SessionOrchestrator.ts
 
 import { v4 as uuidv4 } from 'uuid';
-import { GlobalEvent } from '../types';
-import { fsmReducer, FSMState, Command } from '../FSM';
-import { ttsService } from './TTSService';
+import { GlobalEvent, Command } from '../types';
+import { fsmReducer, FSMState } from '../FSM';
+import { TTSService } from './TTSService';
 import { audioOutputManager } from '../../../services/AudioOutputManager';
-import { metricsCollector } from '../../../services/__tests__/MetricsCollector'; // Importar colector
+import { audioInputManager } from '../../../services/AudioInputManager';
+import { llmService } from './LLMService'; // Asumiendo un servicio para el LLM
 
 const EVENTS_REQUIRING_GENERATION_ID: Set<string> = new Set([
-  'LLM_DELTA_RECEIVED', 'LLM_STREAM_ENDED', 'TTS_AUDIO_CHUNK_RECEIVED',
-  'TTS_STREAM_ENDED', 'AUDIO_PLAYBACK_FINISHED',
+  'LLM_STREAM_ENDED', 'TTS_AUDIO_CHUNK_RECEIVED', 'AUDIO_PLAYBACK_FINISHED',
 ]);
 
 export class SessionOrchestrator {
   private readonly sessionId: string;
   private state: FSMState;
-  public activeGenerationId: string | null = null; // Hacer público para el mock de test
-  public tombstone: Set<string> = new Set(); // Hacer público para el mock de test
+  private ttsService: TTSService;
+  private activeGenerationId: string | null = null;
+  private tombstone: Set<string> = new Set();
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
-    // @ts-ignore
-    const { newState } = fsmReducer(undefined, { type: 'INIT' });
+    this.ttsService = new TTSService(sessionId);
+    const { newState } = fsmReducer(undefined, { type: 'INIT' } as any);
     this.state = newState;
   }
 
   public processEvent(event: GlobalEvent): void {
-    if (event.type === 'VAD_SPEECH_DETECTED' && this.activeGenerationId) {
-      metricsCollector.markBargeInStart(this.activeGenerationId);
+    if (!this.isValidGeneration(event)) {
+      console.warn(`[Orchestrator] Evento ${event.type} de generación obsoleta (${event.generationId}) ignorado.`);
+      return;
     }
-    
-    if (!this.isValidGeneration(event)) return;
 
     const { newState, commands } = fsmReducer(this.state, event);
     this.state = newState;
@@ -39,28 +39,65 @@ export class SessionOrchestrator {
       this.executeCommands(commands);
     }
   }
-  
+
   private executeCommands(commands: Command[]): void {
     for (const command of commands) {
-      // ... (código existente del switch)
-      if (command.type === 'CMD_STOP_AUDIO_PLAYBACK' || command.type === 'CMD_CANCEL_SPEECH_GENERATION') {
+      let cmd = command; // Usar una variable mutable
+
+      // Lógica para invalidar generación antes de la cancelación
+      if (cmd.type === 'CMD_STOP_AUDIO_PLAYBACK' || cmd.type === 'CMD_CANCEL_SPEECH_GENERATION') {
         const cancelledId = this.invalidateCurrentGeneration();
-        if (cancelledId) {
-          if (command.type === 'CMD_CANCEL_SPEECH_GENERATION') {
-            (command.payload as any).generationId = cancelledId;
-          }
+        if (cancelledId && cmd.type === 'CMD_CANCEL_SPEECH_GENERATION') {
+          // Inyectar el ID cancelado en el payload del comando
+          cmd.payload = { ...cmd.payload, generationId: cancelledId };
         }
       }
+      
+      // Lógica para crear una nueva generación
+      if (cmd.type === 'CMD_SEND_END_OF_SPEECH_TO_LLM') {
+        this.activeGenerationId = uuidv4();
+      }
 
-      // Ejecución real
-      switch (command.type) {
+      // Ejecución real de comandos
+      switch (cmd.type) {
+        case 'CMD_START_AUDIO_CAPTURE':
+          console.log(`[Orchestrator:${this.sessionId}] Ejecutando CMD_START_AUDIO_CAPTURE`); // <-- LOG
+          audioInputManager.subscribe(this.sessionId, (chunk) => {
+            llmService.sendAudio(this.sessionId, chunk);
+          });
+          break;
+
+        case 'CMD_STOP_AUDIO_CAPTURE':
+          audioInputManager.unsubscribe(this.sessionId);
+          break;
+
+        case 'CMD_SEND_END_OF_SPEECH_TO_LLM':
+          if (this.activeGenerationId) {
+            llmService.sendEndOfSpeech(this.sessionId, this.activeGenerationId);
+          }
+          break;
+
+        case 'CMD_GENERATE_SPEECH_FROM_TEXT':
+          this.ttsService.generate(cmd.payload.text, cmd.payload.generationId);
+          break;
+
+        case 'CMD_PLAY_AUDIO_CHUNK':
+          audioOutputManager.play({
+            chunk: cmd.payload.chunk,
+            sessionId: this.sessionId,
+            generationId: cmd.payload.generationId,
+          });
+          break;
+
         case 'CMD_STOP_AUDIO_PLAYBACK':
           audioOutputManager.stop(this.sessionId);
           break;
+          
         case 'CMD_CANCEL_SPEECH_GENERATION':
-          // ttsService.cancel((command.payload as any).generationId);
+          if (cmd.payload.generationId) {
+            this.ttsService.cancel(cmd.payload.generationId);
+          }
           break;
-        // ... otros comandos
       }
     }
   }
@@ -68,21 +105,29 @@ export class SessionOrchestrator {
   private invalidateCurrentGeneration(): string | null {
     const cancelledId = this.activeGenerationId;
     if (cancelledId) {
-      metricsCollector.mark(cancelledId, 'invalidation');
       this.tombstone.add(cancelledId);
       this.activeGenerationId = null;
+      // Limpiar el tombstone después de un tiempo para evitar que crezca indefinidamente
       setTimeout(() => this.tombstone.delete(cancelledId), 30000);
     }
     return cancelledId;
   }
 
-  public isValidGeneration(event: GlobalEvent): boolean {
-    // ... (código de validación estricta de la respuesta anterior)
-    return true; // Simplificado para este ejemplo
+  private isValidGeneration(event: GlobalEvent): boolean {
+    if (EVENTS_REQUIRING_GENERATION_ID.has(event.type)) {
+      if (!event.generationId || this.tombstone.has(event.generationId)) {
+        return false;
+      }
+      if (this.activeGenerationId && event.generationId !== this.activeGenerationId) {
+        return false;
+      }
+    }
+    return true;
   }
 
   public cleanup(): void {
     this.invalidateCurrentGeneration();
+    audioInputManager.unsubscribe(this.sessionId);
     audioOutputManager.stop(this.sessionId);
   }
 }

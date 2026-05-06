@@ -17,12 +17,67 @@ interface AuthTokenPayload {
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const speechClient = new SpeechClient();
+console.log(`[GEMINI DEBUG] GEMINI_API_KEY used (partial): ${process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 5) + '...' + process.env.GEMINI_API_KEY.substring(process.env.GEMINI_API_KEY.length - 5) : 'MISSING'}`); // TEMPORARY DEBUG LOG
+
+const speechClient = new SpeechClient({
+  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS, // Opcional: si usas Service Account
+  // O directamente la API Key si no hay archivo de credenciales
+  credentials: { client_email: 'unused', private_key: 'unused' }, // Placeholder si no usas SA
+  projectId: process.env.GOOGLE_CLOUD_PROJECT_ID, // Tu ID de proyecto de Google Cloud
+  key: process.env.GEMINI_API_KEY, // Usa la misma API Key para Speech-to-Text
+});
+
+/**
+ * Simula la generación de Text-to-Speech (TTS) y envía los chunks de audio al cliente.
+ * En una implementación real, aquí se llamaría a una API de TTS como Google Cloud Text-to-Speech.
+ */
+async function generateAndStreamAudio(ws: WebSocket, text: string, generationId: string) {
+  if (ws.readyState !== ws.OPEN) return;
+
+  const send = (message: object) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  };
+
+  console.log(`[TTS] Iniciando generación de audio para: "${text}"`);
+
+  // --- LÓGICA DE TTS SIMULADA ---
+  const words = text.split(' ');
+  for (const word of words) {
+    // Simular la latencia de generación de cada chunk de audio
+    await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 100));
+
+    if (ws.readyState !== ws.OPEN) {
+      console.log('[TTS] Conexión cerrada a mitad de streaming de audio.');
+      return;
+    }
+
+    // Simular un chunk de audio (ArrayBuffer) y enviarlo en base64
+    const fakeAudioChunk = new Uint8Array(1024 + Math.random() * 2048).buffer;
+    const base64Chunk = Buffer.from(fakeAudioChunk).toString('base64');
+    
+    send({ type: 'ai_audio_chunk', chunk: base64Chunk, generationId });
+  }
+
+  send({ type: 'ai_final', generationId });
+  console.log(`[TTS] Finalizada la generación de audio para la generación ${generationId}.`);
+}
 
 export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
   console.info('Attempting to establish a new WebSocket connection...');
   let userId: string = 'unknown';
   let chatHistory: string[] = [];
+  let isSpeechStreamActive = false; // Nuevo estado para el stream de voz
+
+  // Función para destruir el stream de voz de forma segura
+  const destroySpeechStream = () => {
+    if (isSpeechStreamActive) {
+      console.info(`[SpeechStream] Destroying stream for User ID ${userId}.`);
+      recognizeStream.destroy();
+      isSpeechStreamActive = false;
+    }
+  };
 
   try {
     // 1. Authenticate the user from the token in the URL
@@ -33,6 +88,9 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
       ws.close(1008, 'Authentication token missing.');
       return;
     }
+
+    console.log(`[AUTH DEBUG] Received token: ${token ? token.substring(0, 30) + '...' : 'No token'}`);
+    console.log(`[AUTH DEBUG] NEXTAUTH_SECRET used (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`);
 
     const decoded = jwt.verify(token, process.env.NEXTAUTH_SECRET!) as AuthTokenPayload;
     userId = decoded.id;
@@ -54,16 +112,19 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
           sampleRateHertz: 48000,
           languageCode: 'es-ES',
         },
-        interimResults: true, // Get intermediate results
-      })
-      .on('error', (error) => {
+        interimResults: true,
+      });
+    
+    isSpeechStreamActive = true; // El stream se ha inicializado
+
+    recognizeStream.on('error', (error) => {
         console.error(`[SpeechStream] Error for User ID ${userId}:`, error);
+        destroySpeechStream(); // Destruir el stream al detectar un error
       })
       .on('data', async (data) => {
         const transcript = data.results[0]?.alternatives[0]?.transcript;
         if (!transcript) return;
 
-        // Helper para enviar mensajes con formato JSON seguro
         const send = (message: object) => {
           if (ws.readyState === ws.OPEN) {
             ws.send(JSON.stringify(message));
@@ -74,7 +135,6 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
           console.log(`[SpeechStream] Final transcript for User ID ${userId}: "${transcript}"`);
           send({ type: 'user_final', text: transcript });
 
-          // 4. Send the final transcript to Gemini
           try {
             const result = await chat.sendMessageStream(transcript);
             let fullResponseText = '';
@@ -82,15 +142,15 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
             for await (const chunk of result.stream) {
               const part = chunk.candidates?.[0]?.content?.parts?.[0];
               if (part?.text) {
-                // Envía solo el nuevo fragmento (el delta)
                 send({ type: 'ai_delta', text: part.text });
                 fullResponseText += part.text;
               }
             }
-            // Señaliza el final del stream de la IA
             send({ type: 'ai_final' });
 
-            // 5. Save the complete turn to chat history for summarization
+            const generationId = createHash('sha256').update(fullResponseText).digest('hex');
+            await generateAndStreamAudio(ws, fullResponseText, generationId);
+
             chatHistory.push(`user: ${transcript}`);
             chatHistory.push(`model: ${fullResponseText}`);
             console.log(`[Gemini] Turn saved to history for User ID ${userId}.`);
@@ -100,29 +160,28 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
             send({ type: 'error', message: 'Error procesando la respuesta de la IA.' });
           }
         } else {
-          // Send interim transcript to the client for real-time feedback
           send({ type: 'user_interim', text: transcript });
         }
       });
 
-    // 6. Pipe WebSocket messages to the Speech-to-Text stream
+    // 4. Pipe WebSocket messages to the Speech-to-Text stream
     ws.on('message', (message: Buffer) => {
       // console.log(`[WebSocket] Received audio chunk, size: ${message.length}`);
-      if (recognizeStream.writable) {
+      if (isSpeechStreamActive && recognizeStream.writable) { // Solo escribir si el stream está activo
         recognizeStream.write(message);
       }
     });
 
-    // 7. Handle WebSocket closure
+    // 5. Handle WebSocket closure
     ws.on('close', () => {
-      console.info(`Connection closed for User ID: ${userId}. Destroying speech stream.`);
-      recognizeStream.destroy(); // Clean up the stream
-      handleClose(userId, chatHistory); // Proceed with summarization
+      console.info(`Connection closed for User ID: ${userId}.`);
+      destroySpeechStream(); // Destruir el stream de forma segura
+      handleClose(userId, chatHistory); // Proceder con la sumarización
     });
 
     ws.on('error', (error) => {
       console.error(`[WebSocket] Error for User ID ${userId}:`, error);
-      recognizeStream.destroy();
+      destroySpeechStream(); // Destruir el stream de forma segura
     });
 
   } catch (error: any) {
@@ -130,6 +189,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     if (ws.readyState === ws.OPEN) {
       ws.close(1011, 'Internal server error');
     }
+    destroySpeechStream(); // Asegurarse de limpiar el stream en caso de error general
   }
 };
 
@@ -164,28 +224,14 @@ async function handleClose(userId: string, chatHistory: string[]) {
   if (!summary) {
     console.info(`[Cache] MISS for User ID ${userId}. Generating new pedagogical summary...`);
 
-    const SUMMARIZER_SYSTEM_PROMPT = `Eres un Analista Pedagógico de Datos. Tu tarea es recibir la transcripción de una sesión de aprendizaje de idiomas y generar un objeto JSON estrictamente formateado.
-
-CRITERIOS DE ANÁLISIS:
-- Dificultades: Identifica 3 palabras o reglas gramaticales que el usuario usó mal.
-- Logros: Identifica qué tema manejó con fluidez.
-- Feedback: Escribe una frase de 10 palabras animando al usuario basándote en su desempeño real.
-
-FORMATO DE SALIDA (JSON ÚNICAMENTE):
-{
-  "topic": "Resumen de la temática tratada",
-  "masteredTopics": ["tema1", "tema2"],
-  "commonMistakes": ["error1", "error2"],
-  "suggestedNextLesson": "Sugerencia para mañana",
-  "feedback": "Frase de aliento"
-}`;
+    const SUMMARIZER_SYSTEM_PROMPT = `Eres un Analista Pedagógico de Datos. Tu tarea es recibir la transcripción de una sesión de aprendizaje de idiomas y generar un objeto JSON estrictamente formateado.\n\nCRITERIOS DE ANÁLISIS:\n- Dificultades: Identifica 3 palabras o reglas gramaticales que el usuario usó mal.\n- Logros: Identifica qué tema manejó con fluidez.\n- Feedback: Escribe una frase de 10 palabras animando al usuario basándote en su desempeño real.\n\nFORMATO DE SALIDA (JSON ÚNICAMENTE):\n{\n  "topic": "Resumen de la temática tratada",\n  "masteredTopics": ["tema1", "tema2"],\n  "commonMistakes": ["error1", "error2"],\n  "suggestedNextLesson": "Sugerencia para mañana",\n  "feedback": "Frase de aliento"\n}`; // Corregido el template literal
 
     try {
       const summarizer = genAI.getGenerativeModel({
         model: 'gemini-1.5-flash-latest',
         generationConfig: { responseMimeType: 'application/json' },
       });
-      const fullPrompt = `${SUMMARIZER_SYSTEM_PROMPT}\n\nTranscripción:\n${historyString}`;
+      const fullPrompt = `${SUMMARIZER_SYSTEM_PROMPT}\n\nTranscripción:\n${historyString}`; // Corregido el template literal
       const result = await summarizer.generateContent(fullPrompt);
       summary = JSON.parse(result.response.text());
 

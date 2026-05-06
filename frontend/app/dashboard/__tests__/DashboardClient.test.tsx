@@ -1,4 +1,5 @@
 import { render, screen } from '../../__tests__/test-utils';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import DashboardClient from '../DashboardClient';
 import { useAudioStreaming } from '@/app/hooks/useAudioStreaming';
 import { useSession, signOut } from 'next-auth/react';
