@@ -23,9 +23,9 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages }) => {
   }, [chatMessages]);
 
   return (
-    <div className="mb-6 p-4 bg-white rounded-2xl shadow-lg border border-slate-100 h-96 overflow-y-auto flex flex-col-reverse">
-      <div className="space-y-4" ref={messagesEndRef}>
-        {[...chatMessages].reverse().map((msg, index) => (
+    <div className="mb-6 p-4 bg-white rounded-2xl shadow-lg border border-slate-100 h-96 overflow-y-auto">
+      <div className="space-y-4">
+        {chatMessages.map((msg, index) => (
           <div
             key={index}
             className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -39,6 +39,7 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages }) => {
             </div>
           </div>
         ))}
+        <div ref={messagesEndRef} />
       </div>
     </div>
   );

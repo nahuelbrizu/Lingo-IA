@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { audioOutputManager } from '@/app/services/AudioOutputManager';
+import { speechOutputManager } from '@/app/services/SpeechOutputManager';
+import { DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
 
 // ==================================================================
 // 1. TIPOS Y CONSTANTES
@@ -19,20 +20,17 @@ export type ConversationState =
   | 'connecting'    // Conectando al servidor WebSocket.
   | 'listening'     // Conectado y escuchando al usuario.
   | 'processing'    // El usuario dejó de hablar, esperando la respuesta de la IA.
-  | 'ai_speaking'   // La IA está respondiendo (streaming de audio/texto).
+  | 'ai_speaking'   // La IA está respondiendo (streaming de texto + síntesis de voz).
   | 'error';        // Ocurrió un error.
 
 /**
  * @description
- * Mensajes que el servidor puede enviar al cliente.
- * Se utiliza una unión discriminada (`type`) para que TypeScript pueda
- * inferir el tipo de payload de cada mensaje, garantizando seguridad de tipos.
+ * Mensajes que el servidor puede enviar al cliente. El reconocimiento de voz
+ * ahora corre en el navegador (Web Speech API), así que el servidor ya no
+ * envía transcripciones: solo la respuesta de la IA y errores.
  */
 export type ServerMessage =
-  | { type: 'user_interim'; text: string }
-  | { type: 'user_final'; text: string }
   | { type: 'ai_delta'; text: string; generationId: string }
-  | { type: 'ai_audio_chunk'; chunk: string; generationId: string }
   | { type: 'ai_final'; generationId: string }
   | { type: 'error'; message: string };
 
@@ -45,27 +43,12 @@ export interface ChatMessage {
   text: string;
 }
 
-// --- Helper Functions ---
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const binaryString = window.atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
 // --- Constantes de configuración ---
 
 /** Límite superior para el backoff exponencial en ms (30 segundos) */
 const MAX_RECONNECT_DELAY = 30000;
-/** Límite de buffer del WebSocket para control de backpressure. Si se supera, dejamos de enviar audio. */
-const WEBSOCKET_BUFFER_THRESHOLD = 16384; // 16 KB
-/** Umbral de RMS para la detección de silencio (VAD). Ajustar según sensibilidad del mic. */
+/** Umbral de RMS para detectar que el usuario empezó a hablar (usado para el barge-in). */
 const VAD_RMS_THRESHOLD = 0.02;
-/** Duración en ms de silencio antes de considerar que el usuario ha terminado de hablar. */
-const VAD_SILENCE_DURATION_MS = 800;
 /** Intervalo para el throttling de actualizaciones de la UI para el texto de la IA (en ms). */
 const AI_TEXT_THROTTLE_MS = 50;
 
@@ -74,7 +57,7 @@ const AI_TEXT_THROTTLE_MS = 50;
 // 2. EL HOOK PRINCIPAL: useAudioStreaming
 // ==================================================================
 
-export const useAudioStreaming = (authToken: string | null) => {
+export const useAudioStreaming = (authToken: string | null, targetLanguage: LanguageCode = DEFAULT_LANGUAGE) => {
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [lastUserTranscript, setLastUserTranscript] = useState('');
@@ -83,24 +66,31 @@ export const useAudioStreaming = (authToken: string | null) => {
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const analyserNodeRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const shouldRecognizeRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
-  const silenceSinceRef = useRef<number | null>(null);
   const aiResponseBufferRef = useRef('');
+  const bargeInTriggeredRef = useRef(false);
   const lastUiUpdateTimeRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
   const generationIdRef = useRef<string | null>(null);
 
+  const conversationStateRef = useRef(conversationState);
+  useEffect(() => {
+    conversationStateRef.current = conversationState;
+  }, [conversationState]);
+
   const cleanup = useCallback(() => {
     console.log('[Cleanup] Realizando limpieza completa...');
+    shouldRecognizeRef.current = false;
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-    if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop();
+    recognitionRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
     if (audioContextRef.current?.state !== 'closed') audioContextRef.current?.close();
-    if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
+    if (sessionIdRef.current) speechOutputManager.stop(sessionIdRef.current);
     if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
@@ -108,7 +98,7 @@ export const useAudioStreaming = (authToken: string | null) => {
     wsRef.current = null;
     audioContextRef.current = null;
     mediaStreamRef.current = null;
-    mediaRecorderRef.current = null;
+    recognitionRef.current = null;
     animationFrameRef.current = null;
   }, []);
 
@@ -123,58 +113,100 @@ export const useAudioStreaming = (authToken: string | null) => {
     const rms = Math.sqrt(sumOfSquares / dataArray.length);
     setCurrentVolume(rms);
 
-    const currentState = conversationStateRef.current; // Usar ref para el estado
-
-    if (rms > VAD_RMS_THRESHOLD) {
-      silenceSinceRef.current = null;
-      if (currentState === 'ai_speaking') {
-        console.log('[Barge-in] User interruption detected.');
-        if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
-        if (wsRef.current && generationIdRef.current) {
-          wsRef.current.send(JSON.stringify({ type: 'barge_in', generationId: generationIdRef.current }));
-        }
-        aiResponseBufferRef.current = '';
-        setConversationState('listening');
+    // Barge-in: si la IA está hablando y el usuario empieza a hablar, la interrumpimos.
+    // El guard evita que se dispare en cada frame mientras el RMS se mantiene alto
+    // (p.ej. por eco del propio audio de la IA entrando de nuevo por el micrófono).
+    if (rms > VAD_RMS_THRESHOLD && conversationStateRef.current === 'ai_speaking' && !bargeInTriggeredRef.current) {
+      bargeInTriggeredRef.current = true;
+      console.log('[Barge-in] User interruption detected.');
+      if (sessionIdRef.current) speechOutputManager.stop(sessionIdRef.current);
+      if (wsRef.current && generationIdRef.current) {
+        wsRef.current.send(JSON.stringify({ type: 'barge_in', generationId: generationIdRef.current }));
       }
-    } else {
-      if (currentState === 'listening') {
-        if (!silenceSinceRef.current) {
-          silenceSinceRef.current = Date.now();
-        } else if (Date.now() - silenceSinceRef.current > VAD_SILENCE_DURATION_MS) {
-          console.log('[VAD] Silence detected, ending user turn.');
-          if (mediaRecorderRef.current?.state === 'recording') {
-            mediaRecorderRef.current.stop();
-            mediaRecorderRef.current.start(250);
-          }
-          setConversationState('processing');
-        }
-      }
+      aiResponseBufferRef.current = '';
+      setConversationState('listening');
     }
+
     animationFrameRef.current = requestAnimationFrame(analyseAudio);
   }, []);
 
-  const conversationStateRef = useRef(conversationState);
-  useEffect(() => {
-    conversationStateRef.current = conversationState;
-  }, [conversationState]);
+  const sendUserFinalTranscript = useCallback((text: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    // Si la IA ya está procesando o hablando, ignoramos este tramo en vez de
+    // mandar un segundo turno en paralelo: dos respuestas de Claude corriendo
+    // a la vez pisan el buffer de texto de la otra y la síntesis de voz
+    // termina sin nada que decir.
+    if (conversationStateRef.current !== 'listening') {
+      console.log(`[SpeechRecognition] Ignorado (la IA está ocupada): "${text}"`);
+      return;
+    }
+    wsRef.current.send(JSON.stringify({ type: 'user_final', text }));
+    setConversationState('processing');
+    setLastUserTranscript(text);
+    setChatMessages(prev => [...prev, { sender: 'user', text }]);
+  }, []);
 
-  const initRecorder = useCallback(() => {
-    if (!mediaStreamRef.current || !wsRef.current) return;
-    mediaRecorderRef.current = new MediaRecorder(mediaStreamRef.current, { mimeType: 'audio/webm;codecs=opus' });
-    mediaRecorderRef.current.ondataavailable = (event) => {
-      if (wsRef.current && wsRef.current.bufferedAmount > WEBSOCKET_BUFFER_THRESHOLD) {
-        return;
-      }
-      if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(event.data);
+  const initSpeechRecognition = useCallback(() => {
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      setErrorMessage('Este navegador no soporta reconocimiento de voz (Web Speech API).');
+      setConversationState('error');
+      cleanup();
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = targetLanguage;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcript = result[0]?.transcript ?? '';
+        if (!transcript) continue;
+
+        if (result.isFinal) {
+          console.log(`[SpeechRecognition] Final transcript: "${transcript}"`);
+          sendUserFinalTranscript(transcript.trim());
+        } else {
+          setLastUserTranscript(transcript + '...');
+        }
       }
     };
-    mediaRecorderRef.current.start(250);
-  }, []);
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      console.error('[SpeechRecognition] Error:', event.error);
+      if (event.error === 'not-allowed' || event.error === 'audio-capture') {
+        setErrorMessage('Microphone permission denied.');
+        setConversationState('error');
+        cleanup();
+      }
+    };
+
+    // El reconocimiento continuo del navegador se corta solo cada tanto
+    // (silencios largos, límites internos); lo reiniciamos mientras la
+    // conversación siga activa.
+    recognition.onend = () => {
+      if (shouldRecognizeRef.current) {
+        recognition.start();
+      }
+    };
+
+    recognitionRef.current = recognition;
+    shouldRecognizeRef.current = true;
+    recognition.start();
+  }, [cleanup, sendUserFinalTranscript, targetLanguage]);
 
   const initMicrophone = useCallback(async () => {
     try {
-      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Pedimos cancelación de eco explícita: sin esto, el micrófono capta el
+      // propio audio de la síntesis de voz de la IA saliendo por los parlantes
+      // y lo interpreta como que el usuario la está interrumpiendo (barge-in falso).
+      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       if (audioContextRef.current.state === 'suspended') {
         await audioContextRef.current.resume();
@@ -183,14 +215,14 @@ export const useAudioStreaming = (authToken: string | null) => {
       analyserNodeRef.current = audioContextRef.current.createAnalyser();
       analyserNodeRef.current.fftSize = 2048;
       source.connect(analyserNodeRef.current);
-      initRecorder();
+      initSpeechRecognition();
       animationFrameRef.current = requestAnimationFrame(analyseAudio);
     } catch (error: any) {
       setErrorMessage(error.name === 'NotAllowedError' ? 'Microphone permission denied.' : 'No microphone found.');
       setConversationState('error');
       cleanup();
     }
-  }, [analyseAudio, cleanup, initRecorder]);
+  }, [analyseAudio, cleanup, initSpeechRecognition]);
 
   const handleServerMessage = useCallback((event: MessageEvent) => {
     const message: ServerMessage = JSON.parse(event.data);
@@ -199,37 +231,38 @@ export const useAudioStreaming = (authToken: string | null) => {
       aiResponseBufferRef.current = '';
     }
     switch (message.type) {
-      case 'user_interim': setLastUserTranscript(message.text + '...'); break;
-      case 'user_final':
-        setConversationState('processing');
-        setLastUserTranscript(message.text);
-        setChatMessages(prev => [...prev, { sender: 'user', text: message.text }]);
-        break;
       case 'ai_delta':
         if (conversationStateRef.current !== 'ai_speaking') {
+          bargeInTriggeredRef.current = false;
           setConversationState('ai_speaking');
           setChatMessages(prev => [...prev, { sender: 'ai', text: '' }]);
         }
         aiResponseBufferRef.current += message.text;
         break;
-      case 'ai_audio_chunk':
-        if (sessionIdRef.current && generationIdRef.current) {
-          const audioChunk = base64ToArrayBuffer(message.chunk);
-          audioOutputManager.play({ chunk: audioChunk, sessionId: sessionIdRef.current, generationId: generationIdRef.current });
+      case 'ai_final': {
+        const textToSpeak = aiResponseBufferRef.current;
+        aiResponseBufferRef.current = '';
+
+        if (textToSpeak && sessionIdRef.current) {
+          speechOutputManager
+            .speak({ text: textToSpeak, sessionId: sessionIdRef.current, generationId: message.generationId, lang: targetLanguage })
+            .then(() => {
+              if (conversationStateRef.current === 'ai_speaking') {
+                setConversationState('listening');
+              }
+            });
+        } else {
+          setConversationState('listening');
         }
         break;
-      case 'ai_final':
-        setConversationState('listening');
-        aiResponseBufferRef.current = '';
-        silenceSinceRef.current = null;
-        break;
+      }
       case 'error':
         setErrorMessage(message.message);
         setConversationState('error');
         cleanup();
         break;
     }
-  }, [cleanup]);
+  }, [cleanup, targetLanguage]);
 
   const connectWebSocket = useCallback(() => {
     if (!authToken) {
@@ -238,7 +271,7 @@ export const useAudioStreaming = (authToken: string | null) => {
       return;
     }
     cleanup();
-    const url = `${process.env.NEXT_PUBLIC_WEBSOCKET_URL}?token=${authToken}`;
+    const url = `${process.env.NEXT_PUBLIC_WEBSOCKET_URL}?token=${authToken}&lang=${encodeURIComponent(targetLanguage)}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
     setConversationState('connecting');
@@ -257,11 +290,18 @@ export const useAudioStreaming = (authToken: string | null) => {
           reconnectAttemptsRef.current++;
           connectWebSocket();
         }, delay);
-      } else {
+      } else if (event.code === 1000) {
+        // Cierre normal (el propio cliente cortó la conexión vía cleanup/stopConversation).
         setConversationState('idle');
+      } else {
+        // El servidor cerró la conexión por un error (ej. token expirado). Mostrarlo
+        // en vez de resetear en silencio, para que no parezca que los botones no responden.
+        console.error(`[WebSocket] Closed with code ${event.code}: ${event.reason}`);
+        setErrorMessage(event.reason || `Conexión cerrada (código ${event.code}).`);
+        setConversationState('error');
       }
     };
-  }, [authToken, cleanup, initMicrophone, handleServerMessage]);
+  }, [authToken, cleanup, initMicrophone, handleServerMessage, targetLanguage]);
 
   const startConversation = useCallback(() => {
     if (conversationStateRef.current === 'idle') {

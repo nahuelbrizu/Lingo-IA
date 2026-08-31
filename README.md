@@ -1,98 +1,91 @@
-# Arquitectura del Motor Conversacional en Tiempo Real
+# Lingo AI - Conversational Language Tutor
 
-Este documento detalla la arquitectura del sistema de conversación multi-sesión, diseñado para ser robusto, escalable y performante. La arquitectura se basa en principios de sistemas event-driven, máquinas de estado finitas y gestión de concurrencia para manejar interacciones de voz complejas en tiempo real.
+Lingo AI is a real-time conversational language tutoring application. Speech recognition and speech synthesis both run client-side via the browser's Web Speech API; the backend focuses on the AI conversation logic (Claude) and session persistence.
 
-## 1. Principios de Diseño
+## Project Structure
 
-- **Separación de Responsabilidades (SRP):** Cada módulo tiene una única y bien definida responsabilidad (ej. transporte de red, captura de audio, lógica de estado).
-- **Inmutabilidad y Flujo de Datos Unidireccional:** La lógica de estado es manejada por un reducer puro (FSM) que no tiene efectos secundarios. El estado fluye en una sola dirección: `Evento → FSM → Comando → Efecto Secundario`.
-- **Aislamiento de Sesiones:** Cada conversación es una unidad aislada con su propio estado. La interferencia entre sesiones (cross-talk) es prevenida a nivel de arquitectura.
-- **Cancelación Explícita:** Todos los flujos de trabajo asíncronos (streaming de LLM, TTS) son cancelables mediante un `generationId`, lo que permite interrupciones de baja latencia (barge-in).
-- **Gestión Centralizada de Recursos:** Los recursos de hardware compartidos (micrófono, altavoces) son gestionados por singletons globales con contadores de referencia para un uso eficiente.
+This is a monorepo project split into two main parts:
 
-## 2. Diagrama de Arquitectura Conceptual
+- **`/frontend`**: A Next.js application built with React, handling the UI, microphone input, speech recognition/synthesis via the Web Speech API, and WebSocket communication with the backend.
+- **`/backend`**: A Node.js server using WebSockets (`ws`), Prisma for database interactions, and the Anthropic API (Claude) for the conversation model.
 
-```plaintext
-                   +--------------------------------+
-                   |           UI Layer             |
-                   | (React Components/Hooks)       |
-                   +--------------------------------+
-                                  ^
-                                  | (State Updates, Events)
-                                  v
-+-------------------------------------------------------------------------+
-|                         Event Bus (Global)                              |
-+-------------------------------------------------------------------------+
-       ^                                      |
-       | (Events from Services)               | (Events to Session Manager)
-       |                                      v
-+-------------------------------------------------------------------------+
-|                          SessionManager (Singleton)                     |
-|-------------------------------------------------------------------------|
-| - Registry: Map<sessionId, SessionInstance>                             |
-| - Factory: createSession() / destroySession()                           |
-| - Router: Enruta eventos a la sesión correcta                           |
-| - Focus Control: Gestiona activeListeningSessionId                      |
-+-------------------------------------------------------------------------+
-                                  |
-                                  | (Dispatches events to a specific instance)
-                                  v
-+-------------------------------------------------------------------------+
-|                           SessionInstance                               |
-|-------------------------------------------------------------------------|
-| - Orchestrator (Maneja efectos secundarios)                             |
-| - FSM (Reducer puro, calcula el siguiente estado y comandos)            |
-| - State (chatHistory, activeGenerationId, tombstone)                    |
-+-------------------------------------------------------------------------+
-       ^                         ^                         ^
-       | (Commands)              | (Audio Chunks)          | (TTS Audio Chunks)
-       v                         v                         v
-+------------------+     +------------------+     +-----------------------+
-| WebSocketService |     | AudioInputManager|     | AudioOutputManager    |
-| (1 por Sesión)   |     | (Singleton)      |     | (Singleton)           |
-+------------------+     +------------------+     +-----------------------+
+## Features
+
+- **Browser-based STT (Web Speech API):** The user's speech is transcribed client-side using the browser's native `SpeechRecognition` — only the resulting text is sent to the backend, no raw audio.
+- **Claude AI Integration:** Processes the transcribed text using `claude-sonnet-5` with a specific system prompt to act as a friendly Spanish tutor, with tool-calling support.
+- **Browser-based TTS (Web Speech API):** The AI's text response is synthesized client-side using the browser's native `speechSynthesis` API — no audio is generated or streamed by the backend.
+- **Barge-in capability:** Detects when the user interrupts the AI (Voice Activity Detection - VAD) and instantly cancels the current speech synthesis and the in-flight Claude generation.
+- **Pedagogical Summarization:** Automatically summarizes the conversation upon disconnection using `claude-sonnet-5` (via a forced tool call for structured JSON output) to identify common mistakes, mastered topics, and provides personalized feedback, storing the results via Prisma.
+
+## Architecture Highlights
+
+- **Finite State Machine (FSM):** The frontend conversation lifecycle is governed by an FSM (idle -> connecting -> listening -> processing -> ai_speaking), preventing race conditions and inconsistent states.
+- **Generation IDs:** A unique `generationId` tracks the lifecycle of an AI response. If the user interrupts (barge-in), the current `generationId` is invalidated, preventing "ghost" speech.
+- **SpeechOutputManager Singleton:** A centralized manager wrapping the browser's `speechSynthesis` API, using the same sessionId/generationId locking scheme to allow clean cancellation on barge-in.
+
+## Local Development Setup
+
+### Prerequisites
+
+- Node.js (v20+ recommended)
+- An Anthropic API Key (for Claude)
+- A browser with Web Speech API support (Chrome, Edge, Safari) for STT + TTS
+- Postgres Database (or change the Prisma provider in `backend/prisma/schema.prisma`)
+- A Google OAuth app (for NextAuth login only — unrelated to speech/AI)
+
+### Environment Variables
+
+You need to create a `.env` file in the `backend/` directory with the following variables:
+
+```env
+# Backend .env
+DATABASE_URL="postgresql://user:password@localhost:5432/lingodb?schema=public"
+NEXTAUTH_SECRET="your_nextauth_secret_for_jwt_verification"
+
+# Claude (Anthropic)
+ANTHROPIC_API_KEY="your_anthropic_api_key"
 ```
 
-## 3. Componentes Clave
+In the `frontend/` directory, create a `.env.local` file:
 
-### 3.1. Singletons Globales (`/app/services`)
+```env
+# Frontend .env.local
+NEXT_PUBLIC_WEBSOCKET_URL="ws://localhost:8080"
+```
 
-- **`EventBus`:** Un bus de eventos Pub/Sub simple que actúa como el sistema nervioso central para la comunicación desacoplada.
-- **`AudioInputManager`:** Gestiona el acceso al micrófono. Utiliza un **contador de referencias** para iniciar `getUserMedia` solo cuando la primera sesión lo necesita y detenerlo cuando la última sesión termina. Despacha chunks de audio directamente a las sesiones suscritas para máxima eficiencia.
-- **`AudioOutputManager`:** Gestiona el `AudioContext` y la reproducción de audio. Implementa un **lock por `sessionId`** para prevenir que el audio de múltiples sesiones se mezcle. Incluye un **watchdog timer** para liberar el lock si la reproducción se atasca, previniendo deadlocks.
+### Installation
 
-### 3.2. Arquitectura de Sesión (`/app/hooks/useConversation`)
+Install dependencies from the root directory. This will install dependencies for both the frontend and backend workspaces.
 
-- **`SessionManager`:** El orquestador de la concurrencia.
-  - **Registry/Factory:** Crea, registra y destruye `SessionInstance`.
-  - **Router:** Escucha el `EventBus` global y enruta cada evento a la `SessionInstance` correspondiente basándose en el `sessionId`.
-  - **Focus Manager:** Controla qué sesión tiene el "foco de escucha" (`activeListeningSessionId`) para garantizar que solo una sesión procese activamente el audio del micrófono a la vez.
-  - **Garbage Collector:** Implementa un `setInterval` para destruir automáticamente las sesiones que han estado inactivas por más de un umbral definido, previniendo fugas de memoria.
+```bash
+npm install
+```
 
-- **`SessionInstance`:** Encapsula todo lo relacionado con una única conversación.
-  - **`SessionOrchestrator`:** El "cerebro" de la sesión.
-    - Recibe eventos del `SessionManager`.
-    - Pasa el estado actual y el evento al `fsmReducer`.
-    - Ejecuta los `Commands` devueltos por la FSM, interactuando con los servicios (TTS, LLM, etc.).
-    - Gestiona el `activeGenerationId` y el `tombstone` set para la cancelación.
-  - **`FSM` (Reducer Puro):** Una función pura `(state, event) => ({ newState, commands })`. No tiene efectos secundarios. Su única responsabilidad es calcular el siguiente estado y la lista de acciones a realizar. Esto la hace extremadamente predecible y fácil de testear unitariamente.
+### Database Setup
 
-### 3.3. El Mecanismo `generationId`
+Navigate to the `backend/` directory and run Prisma migrations to set up your database schema:
 
-El `generationId` es la piedra angular para prevenir race conditions en un entorno de streaming.
+```bash
+cd backend
+npx prisma migrate dev
+```
 
-1.  **Creación:** Se crea un `generationId` único en el `Orchestrator` en el momento en que se inicia una nueva respuesta de IA (después de que el usuario termina de hablar).
-2.  **Propagación:** El `generationId` se propaga a través de toda la cadena de procesamiento: `LLMService` → `TTSService` → `AudioOutputManager`.
-3.  **Invalidación (Barge-in):** Cuando el usuario interrumpe, el `Orchestrator` establece inmediatamente su `activeGenerationId` a `null` y añade el ID cancelado a un `tombstone` set.
-4.  **Validación:** Todos los servicios y el `Orchestrator` validan los eventos entrantes. Si un evento llega con un `generationId` que no coincide con el `activeGenerationId`, es un "evento fantasma" de una generación anterior y se descarta de forma segura.
+### Running the Application
 
-## 4. Testing
+You can run both the frontend and backend concurrently from the root directory using:
 
-La validación de esta arquitectura se basa en un "Test Harness" de grado de producción (`/app/hooks/useConversation/__tests__/harness`).
+```bash
+npm run dev
+```
 
-- **Tests de Aislamiento y Fugas (`Isolation.test.ts`):** Verifica que el `SessionManager` limpia correctamente los recursos y que no hay "cross-talk" entre sesiones. Simula ciclos masivos de creación/destrucción para asegurar que los contadores de referencias y las desuscripciones funcionen.
-- **Fuzz Testing (`Fuzz.test.ts`):** Un motor de fuzzing "state-aware" ejecuta miles de secuencias de eventos aleatorios y corruptos contra el `Orchestrator`. Después de cada evento, un **`InvariantChecker`** valida que el estado interno del sistema no se haya corrompido. Si se detecta una violación, el test falla con la secuencia exacta de eventos para una reproducción determinista.
-- **Tests de Performance (`BargeIn.perf.test.ts`):** Un test automatizado mide la latencia de "barge-in" desde la detección de voz hasta la parada del audio. Calcula métricas como el promedio y el **percentil 95 (p95)** y falla el pipeline de CI/CD si no se cumple el Objetivo de Nivel de Servicio (SLO) definido (ej. p95 < 100ms).
+- The Next.js frontend will be available at `http://localhost:3000`.
+- The WebSocket backend will listen on `ws://localhost:8080`.
 
-Este enfoque de testing en múltiples capas garantiza la robustez, consistencia y performance del sistema bajo condiciones adversas.
-# audioProject
+## Testing
+
+The frontend contains comprehensive tests for the state management, FSM logic, and managers. Run them using:
+
+```bash
+cd frontend
+npm run test
+```

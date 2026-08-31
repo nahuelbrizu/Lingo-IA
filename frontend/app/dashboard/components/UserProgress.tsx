@@ -53,9 +53,9 @@ export const UserProgress: React.FC<UserProgressProps> = ({ data, isLoading }) =
         </h3>
         <div className="flex flex-wrap gap-2">
           {data?.analytics?.masteredTopics && data.analytics.masteredTopics.length > 0 ? (
-            data.analytics.masteredTopics.map((topic: string) => (
+            data.analytics.masteredTopics.map((topic: string, index: number) => (
               <span
-                key={topic}
+                key={`${topic}-${index}`}
                 className="px-3 py-1 bg-green-100 text-green-700 rounded-full text-sm font-medium"
               >
                 ✓ {topic}

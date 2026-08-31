@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useSession, signOut } from 'next-auth/react';
 import { useAudioStreaming } from '@/app/hooks/useAudioStreaming';
+import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
 
 // Importando los nuevos componentes con responsabilidades únicas
 import { ChatHistory } from './components/ChatHistory';
@@ -10,6 +11,7 @@ import { StatusDisplay } from './components/StatusDisplay';
 import { ActionControls } from './components/ActionControls';
 import { VolumeVisualizer } from './components/VolumeVisualizer';
 import { UserProgress } from './components/UserProgress';
+import { LanguageSelector } from './components/LanguageSelector';
 
 /**
  * @description
@@ -29,6 +31,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
   const { data: session } = useSession();
   const [userData, setUserData] = useState(initialData);
   const [isLoadingData, setIsLoadingData] = useState(false);
+  const [targetLanguage, setTargetLanguage] = useState<LanguageCode>(DEFAULT_LANGUAGE);
 
   // El token de autenticación para el WebSocket ahora se extrae de forma segura.
   const authToken = (session as any)?.wsToken;
@@ -41,7 +44,9 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     startConversation,
     stopConversation,
     currentVolume,
-  } = useAudioStreaming(authToken);
+  } = useAudioStreaming(authToken, targetLanguage);
+
+  const languageLabel = SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
 
   const refreshUserData = async () => {
     setIsLoadingData(true);
@@ -72,7 +77,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
             ¡Hola, {userData?.name || 'usuario'}!
           </h1>
           <p className="text-slate-500 text-sm sm:text-base">
-            Tu sesión de práctica de español.
+            Tu sesión de práctica de {languageLabel.toLowerCase()}.
           </p>
         </div>
         <button
@@ -91,7 +96,15 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
           lastUserTranscript={lastUserTranscript}
         />
         {errorMessage && <p className="text-red-500 text-center">{errorMessage}</p>}
-        
+
+        <div className="flex justify-center">
+          <LanguageSelector
+            value={targetLanguage}
+            onChange={setTargetLanguage}
+            disabled={conversationState !== 'idle'}
+          />
+        </div>
+
         <div className="flex items-center justify-center space-x-4 p-4 bg-white rounded-2xl shadow-sm border border-slate-100">
           <ActionControls
             conversationState={conversationState}

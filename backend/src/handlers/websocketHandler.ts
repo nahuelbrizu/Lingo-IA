@@ -2,13 +2,11 @@
 import { WebSocket } from 'ws';
 import { createHash } from 'crypto';
 import { IncomingMessage } from 'http';
-import { GoogleGenerativeAI, Tool } from '@google/generative-ai';
+import Anthropic from '@anthropic-ai/sdk';
 import { prisma } from '../services/prismaService';
-import { declarationTools } from '../config';
+import { conversationTools, summaryTool } from '../config';
 import jwt from 'jsonwebtoken';
 import url from 'url';
-import { SpeechClient } from '@google-cloud/speech';
-import { google } from '@google-cloud/speech/build/protos/protos';
 
 interface AuthTokenPayload {
   id: string;
@@ -16,78 +14,46 @@ interface AuthTokenPayload {
   exp: number;
 }
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-console.log(`[GEMINI DEBUG] GEMINI_API_KEY used (partial): ${process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 5) + '...' + process.env.GEMINI_API_KEY.substring(process.env.GEMINI_API_KEY.length - 5) : 'MISSING'}`); // TEMPORARY DEBUG LOG
+type ClientMessage =
+  | { type: 'user_final'; text: string }
+  | { type: 'barge_in' };
 
-const speechClient = new SpeechClient({
-  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS, // Opcional: si usas Service Account
-  // O directamente la API Key si no hay archivo de credenciales
-  credentials: { client_email: 'unused', private_key: 'unused' }, // Placeholder si no usas SA
-  projectId: process.env.GOOGLE_CLOUD_PROJECT_ID, // Tu ID de proyecto de Google Cloud
-  key: process.env.GEMINI_API_KEY, // Usa la misma API Key para Speech-to-Text
-});
+const CLAUDE_MODEL = 'claude-sonnet-5';
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-/**
- * Simula la generación de Text-to-Speech (TTS) y envía los chunks de audio al cliente.
- * En una implementación real, aquí se llamaría a una API de TTS como Google Cloud Text-to-Speech.
- */
-async function generateAndStreamAudio(ws: WebSocket, text: string, generationId: string) {
-  if (ws.readyState !== ws.OPEN) return;
-
-  const send = (message: object) => {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(message));
-    }
-  };
-
-  console.log(`[TTS] Iniciando generación de audio para: "${text}"`);
-
-  // --- LÓGICA DE TTS SIMULADA ---
-  const words = text.split(' ');
-  for (const word of words) {
-    // Simular la latencia de generación de cada chunk de audio
-    await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 100));
-
-    if (ws.readyState !== ws.OPEN) {
-      console.log('[TTS] Conexión cerrada a mitad de streaming de audio.');
-      return;
-    }
-
-    // Simular un chunk de audio (ArrayBuffer) y enviarlo en base64
-    const fakeAudioChunk = new Uint8Array(1024 + Math.random() * 2048).buffer;
-    const base64Chunk = Buffer.from(fakeAudioChunk).toString('base64');
-    
-    send({ type: 'ai_audio_chunk', chunk: base64Chunk, generationId });
-  }
-
-  send({ type: 'ai_final', generationId });
-  console.log(`[TTS] Finalizada la generación de audio para la generación ${generationId}.`);
-}
+// Debe reflejar SUPPORTED_LANGUAGES en frontend/app/config.ts. Se valida contra
+// esta whitelist en vez de confiar en el query param crudo (va directo al
+// system prompt de Claude).
+const SUPPORTED_LANGUAGES: Record<string, string> = {
+  'en-US': 'English',
+  'es-ES': 'Spanish',
+  'fr-FR': 'French',
+  'de-DE': 'German',
+  'it-IT': 'Italian',
+  'pt-BR': 'Portuguese',
+};
+const DEFAULT_LANGUAGE_CODE = 'en-US';
 
 export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
   console.info('Attempting to establish a new WebSocket connection...');
   let userId: string = 'unknown';
   let chatHistory: string[] = [];
-  let isSpeechStreamActive = false; // Nuevo estado para el stream de voz
-
-  // Función para destruir el stream de voz de forma segura
-  const destroySpeechStream = () => {
-    if (isSpeechStreamActive) {
-      console.info(`[SpeechStream] Destroying stream for User ID ${userId}.`);
-      recognizeStream.destroy();
-      isSpeechStreamActive = false;
-    }
-  };
+  let currentStream: ReturnType<typeof anthropic.messages.stream> | null = null;
 
   try {
     // 1. Authenticate the user from the token in the URL
     const { search } = url.parse(req.url!);
-    const token = new URLSearchParams(search || '').get('token');
+    const queryParams = new URLSearchParams(search || '');
+    const token = queryParams.get('token');
     if (!token) {
       console.warn('Authentication token missing. Closing connection.');
       ws.close(1008, 'Authentication token missing.');
       return;
     }
+
+    const requestedLangCode = queryParams.get('lang') ?? DEFAULT_LANGUAGE_CODE;
+    const languageCode = requestedLangCode in SUPPORTED_LANGUAGES ? requestedLangCode : DEFAULT_LANGUAGE_CODE;
+    const languageName = SUPPORTED_LANGUAGES[languageCode];
 
     console.log(`[AUTH DEBUG] Received token: ${token ? token.substring(0, 30) + '...' : 'No token'}`);
     console.log(`[AUTH DEBUG] NEXTAUTH_SECRET used (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`);
@@ -96,92 +62,88 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     userId = decoded.id;
     console.info(`Client authenticated and connected. User ID: ${userId}`);
 
-    // 2. Setup Gemini Chat Model
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      systemInstruction:
-        'You are a friendly and helpful Spanish language tutor. Your goal is to have a natural conversation with the user. Keep your responses concise and natural.',
-    });
-    const chat = model.startChat({ tools: declarationTools as Tool[] });
+    // 2. Setup Claude conversation state
+    const TUTOR_SYSTEM_PROMPT =
+      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner, and only switch to the student's native language briefly if they seem completely lost. Your goal is to have a natural conversation with the user. Keep your responses concise and natural.`;
+    const messages: Anthropic.MessageParam[] = [];
+    console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}).`);
 
-    // 3. Setup Google Cloud Speech-to-Text Streaming Recognition
-    const recognizeStream = speechClient
-      .streamingRecognize({
-        config: {
-          encoding: 'WEBM_OPUS',
-          sampleRateHertz: 48000,
-          languageCode: 'es-ES',
-        },
-        interimResults: true,
-      });
-    
-    isSpeechStreamActive = true; // El stream se ha inicializado
+    const send = (message: object) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify(message));
+      }
+    };
 
-    recognizeStream.on('error', (error) => {
-        console.error(`[SpeechStream] Error for User ID ${userId}:`, error);
-        destroySpeechStream(); // Destruir el stream al detectar un error
-      })
-      .on('data', async (data) => {
-        const transcript = data.results[0]?.alternatives[0]?.transcript;
-        if (!transcript) return;
+    // 3. Handle transcripts sent by the client (speech-to-text now runs in the
+    // browser via the Web Speech API, so the server only receives already-transcribed text).
+    ws.on('message', async (raw: Buffer) => {
+      let payload: ClientMessage;
+      try {
+        payload = JSON.parse(raw.toString());
+      } catch {
+        console.warn(`[WebSocket] Mensaje no-JSON ignorado de User ID ${userId}.`);
+        return;
+      }
 
-        const send = (message: object) => {
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify(message));
-          }
-        };
+      if (payload.type === 'barge_in') {
+        console.log(`[Claude] Barge-in recibido para User ID ${userId}. Abortando generación en curso.`);
+        currentStream?.abort();
+        return;
+      }
 
-        if (data.results[0].isFinal) {
-          console.log(`[SpeechStream] Final transcript for User ID ${userId}: "${transcript}"`);
-          send({ type: 'user_final', text: transcript });
+      if (payload.type !== 'user_final' || !payload.text?.trim()) return;
+      const transcript = payload.text.trim();
 
-          try {
-            const result = await chat.sendMessageStream(transcript);
-            let fullResponseText = '';
+      console.log(`[Transcript] Final transcript for User ID ${userId}: "${transcript}"`);
 
-            for await (const chunk of result.stream) {
-              const part = chunk.candidates?.[0]?.content?.parts?.[0];
-              if (part?.text) {
-                send({ type: 'ai_delta', text: part.text });
-                fullResponseText += part.text;
-              }
-            }
-            send({ type: 'ai_final' });
+      try {
+        messages.push({ role: 'user', content: transcript });
 
-            const generationId = createHash('sha256').update(fullResponseText).digest('hex');
-            await generateAndStreamAudio(ws, fullResponseText, generationId);
+        const stream = anthropic.messages.stream({
+          model: CLAUDE_MODEL,
+          max_tokens: 1024,
+          system: TUTOR_SYSTEM_PROMPT,
+          tools: conversationTools,
+          messages,
+        });
+        currentStream = stream;
 
-            chatHistory.push(`user: ${transcript}`);
-            chatHistory.push(`model: ${fullResponseText}`);
-            console.log(`[Gemini] Turn saved to history for User ID ${userId}.`);
+        let fullResponseText = '';
+        stream.on('text', (textDelta) => {
+          send({ type: 'ai_delta', text: textDelta });
+          fullResponseText += textDelta;
+        });
 
-          } catch (geminiError) {
-            console.error(`[Gemini] Error for User ID ${userId}:`, geminiError);
-            send({ type: 'error', message: 'Error procesando la respuesta de la IA.' });
-          }
+        const finalMessage = await stream.finalMessage();
+        const generationId = createHash('sha256').update(fullResponseText).digest('hex');
+        send({ type: 'ai_final', generationId });
+
+        messages.push({ role: 'assistant', content: finalMessage.content });
+        chatHistory.push(`user: ${transcript}`);
+        chatHistory.push(`model: ${fullResponseText}`);
+        console.log(`[Claude] Turn saved to history for User ID ${userId}.`);
+
+      } catch (claudeError) {
+        if (claudeError instanceof Anthropic.APIUserAbortError) {
+          console.log(`[Claude] Generación abortada por barge-in para User ID ${userId}.`);
         } else {
-          send({ type: 'user_interim', text: transcript });
+          console.error(`[Claude] Error for User ID ${userId}:`, claudeError);
+          send({ type: 'error', message: 'Error procesando la respuesta de la IA.' });
         }
-      });
-
-    // 4. Pipe WebSocket messages to the Speech-to-Text stream
-    ws.on('message', (message: Buffer) => {
-      // console.log(`[WebSocket] Received audio chunk, size: ${message.length}`);
-      if (isSpeechStreamActive && recognizeStream.writable) { // Solo escribir si el stream está activo
-        recognizeStream.write(message);
+      } finally {
+        currentStream = null;
       }
     });
 
-    // 5. Handle WebSocket closure
+    // 4. Handle WebSocket closure
     ws.on('close', () => {
       console.info(`Connection closed for User ID: ${userId}.`);
-      destroySpeechStream(); // Destruir el stream de forma segura
+      currentStream?.abort();
       handleClose(userId, chatHistory); // Proceder con la sumarización
     });
 
     ws.on('error', (error) => {
       console.error(`[WebSocket] Error for User ID ${userId}:`, error);
-      destroySpeechStream(); // Destruir el stream de forma segura
     });
 
   } catch (error: any) {
@@ -189,7 +151,6 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     if (ws.readyState === ws.OPEN) {
       ws.close(1011, 'Internal server error');
     }
-    destroySpeechStream(); // Asegurarse de limpiar el stream en caso de error general
   }
 };
 
@@ -227,13 +188,22 @@ async function handleClose(userId: string, chatHistory: string[]) {
     const SUMMARIZER_SYSTEM_PROMPT = `Eres un Analista Pedagógico de Datos. Tu tarea es recibir la transcripción de una sesión de aprendizaje de idiomas y generar un objeto JSON estrictamente formateado.\n\nCRITERIOS DE ANÁLISIS:\n- Dificultades: Identifica 3 palabras o reglas gramaticales que el usuario usó mal.\n- Logros: Identifica qué tema manejó con fluidez.\n- Feedback: Escribe una frase de 10 palabras animando al usuario basándote en su desempeño real.\n\nFORMATO DE SALIDA (JSON ÚNICAMENTE):\n{\n  "topic": "Resumen de la temática tratada",\n  "masteredTopics": ["tema1", "tema2"],\n  "commonMistakes": ["error1", "error2"],\n  "suggestedNextLesson": "Sugerencia para mañana",\n  "feedback": "Frase de aliento"\n}`; // Corregido el template literal
 
     try {
-      const summarizer = genAI.getGenerativeModel({
-        model: 'gemini-1.5-flash-latest',
-        generationConfig: { responseMimeType: 'application/json' },
+      const result = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: SUMMARIZER_SYSTEM_PROMPT,
+        tools: [summaryTool],
+        tool_choice: { type: 'tool', name: summaryTool.name },
+        messages: [{ role: 'user', content: `Transcripción:\n${historyString}` }],
       });
-      const fullPrompt = `${SUMMARIZER_SYSTEM_PROMPT}\n\nTranscripción:\n${historyString}`; // Corregido el template literal
-      const result = await summarizer.generateContent(fullPrompt);
-      summary = JSON.parse(result.response.text());
+
+      const toolUse = result.content.find(
+        (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
+      );
+      if (!toolUse) {
+        throw new Error('Claude no devolvió un resumen estructurado.');
+      }
+      summary = toolUse.input as any;
 
       // 3. Save the new summary to the cache
       await prisma.sessionSummary.create({

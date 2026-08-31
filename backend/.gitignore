@@ -8,4 +8,5 @@ node_modules
 dist
 
 # Ignore Google Cloud credentials
-*.json
+service_account.json
+*-credentials.json
