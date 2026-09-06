@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { audioOutputManager } from '@/app/services/AudioOutputManager';
-import { DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
+import { DEFAULT_LANGUAGE, DEFAULT_SOURCE_LANGUAGE, type LanguageCode } from '@/app/config';
 
 // ==================================================================
 // 1. TIPOS Y CONSTANTES
@@ -34,6 +34,7 @@ export type ServerMessage =
   | { type: 'ai_delta'; text: string; generationId: string }
   | { type: 'ai_audio_chunk'; chunk: string; generationId: string }
   | { type: 'ai_final'; generationId: string }
+  | { type: 'translation'; messageIndex: number; translatedText: string }
   | { type: 'error'; message: string };
 
 // --- Helper Functions ---
@@ -54,14 +55,14 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 export interface ChatMessage {
   sender: 'user' | 'ai';
   text: string;
+  translation?: string;
+  isTranslating?: boolean;
 }
 
 // --- Constantes de configuración ---
 
 /** Límite superior para el backoff exponencial en ms (30 segundos) */
 const MAX_RECONNECT_DELAY = 30000;
-/** Umbral de RMS para detectar que el usuario empezó a hablar (usado para el barge-in). */
-const VAD_RMS_THRESHOLD = 0.02;
 /** Intervalo para el throttling de actualizaciones de la UI para el texto de la IA (en ms). */
 const AI_TEXT_THROTTLE_MS = 50;
 
@@ -70,13 +71,18 @@ const AI_TEXT_THROTTLE_MS = 50;
 // 2. EL HOOK PRINCIPAL: useAudioStreaming
 // ==================================================================
 
-export const useAudioStreaming = (authToken: string | null, targetLanguage: LanguageCode = DEFAULT_LANGUAGE) => {
+export const useAudioStreaming = (
+  authToken: string | null,
+  targetLanguage: LanguageCode = DEFAULT_LANGUAGE,
+  sourceLanguage: LanguageCode = DEFAULT_SOURCE_LANGUAGE
+) => {
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [lastUserTranscript, setLastUserTranscript] = useState('');
   const [currentVolume, setCurrentVolume] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
   const [authExpired, setAuthExpired] = useState(false);
+  const [isMicPaused, setIsMicPaused] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -85,10 +91,12 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
   const animationFrameRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const shouldRecognizeRef = useRef(false);
+  const micPausedRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
   const aiResponseBufferRef = useRef('');
-  const bargeInTriggeredRef = useRef(false);
   const hasAudioRef = useRef(false);
+  const pendingAudioChunksRef = useRef(0);
+  const finalReceivedRef = useRef(false);
   const lastUiUpdateTimeRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
   const generationIdRef = useRef<string | null>(null);
@@ -101,6 +109,8 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
   const cleanup = useCallback(() => {
     console.log('[Cleanup] Realizando limpieza completa...');
     shouldRecognizeRef.current = false;
+    micPausedRef.current = false;
+    setIsMicPaused(false);
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     recognitionRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
@@ -127,22 +137,34 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     }
     const rms = Math.sqrt(sumOfSquares / dataArray.length);
     setCurrentVolume(rms);
-
-    // Barge-in: si la IA está hablando y el usuario empieza a hablar, la interrumpimos.
-    // El guard evita que se dispare en cada frame mientras el RMS se mantiene alto
-    // (p.ej. por eco del propio audio de la IA entrando de nuevo por el micrófono).
-    if (rms > VAD_RMS_THRESHOLD && conversationStateRef.current === 'ai_speaking' && !bargeInTriggeredRef.current) {
-      bargeInTriggeredRef.current = true;
-      console.log('[Barge-in] User interruption detected.');
-      if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
-      if (wsRef.current && generationIdRef.current) {
-        wsRef.current.send(JSON.stringify({ type: 'barge_in', generationId: generationIdRef.current }));
-      }
-      aiResponseBufferRef.current = '';
-      setConversationState('listening');
-    }
-
     animationFrameRef.current = requestAnimationFrame(analyseAudio);
+  }, []);
+
+  /**
+   * El SpeechRecognition del navegador captura el micrófono con su propio
+   * pipeline de audio interno — no respeta el `echoCancellation` que le
+   * pedimos al stream del analizador, así que si lo dejamos activo mientras
+   * la IA habla, puede reconocer su propia voz saliendo por los parlantes y
+   * "auto-cancelarse". Por eso lo pausamos por completo durante ai_speaking
+   * en vez de intentar filtrar el eco.
+   */
+  const pauseMic = useCallback(() => {
+    if (micPausedRef.current) return;
+    micPausedRef.current = true;
+    setIsMicPaused(true);
+    recognitionRef.current?.stop();
+  }, []);
+
+  const resumeMic = useCallback(() => {
+    if (!micPausedRef.current) return;
+    micPausedRef.current = false;
+    setIsMicPaused(false);
+    try {
+      recognitionRef.current?.start();
+    } catch {
+      // Puede que el stop() anterior todavía no haya terminado; el propio
+      // onend lo va a reiniciar solo en cuanto micPausedRef ya esté en false.
+    }
   }, []);
 
   const sendUserFinalTranscript = useCallback((text: string) => {
@@ -202,9 +224,9 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
 
     // El reconocimiento continuo del navegador se corta solo cada tanto
     // (silencios largos, límites internos); lo reiniciamos mientras la
-    // conversación siga activa.
+    // conversación siga activa y no esté pausado a propósito (IA hablando).
     recognition.onend = () => {
-      if (shouldRecognizeRef.current) {
+      if (shouldRecognizeRef.current && !micPausedRef.current) {
         recognition.start();
       }
     };
@@ -245,24 +267,32 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
       generationIdRef.current = message.generationId;
       aiResponseBufferRef.current = '';
       hasAudioRef.current = false;
+      pendingAudioChunksRef.current = 0;
+      finalReceivedRef.current = false;
     }
     switch (message.type) {
       case 'ai_delta':
         if (conversationStateRef.current !== 'ai_speaking') {
-          bargeInTriggeredRef.current = false;
+          pauseMic();
           setConversationState('ai_speaking');
           setChatMessages(prev => [...prev, { sender: 'ai', text: '' }]);
         }
         aiResponseBufferRef.current += message.text;
         break;
       case 'ai_audio_chunk': {
+        // El backend sintetiza oración por oración, así que puede llegar más de
+        // un chunk por turno; solo pasamos a "listening" cuando termina de sonar
+        // el último Y ya llegó el ai_final (no antes, o cortaríamos a mitad de frase).
         hasAudioRef.current = true;
+        pendingAudioChunksRef.current += 1;
         if (sessionIdRef.current) {
           const audioChunk = base64ToArrayBuffer(message.chunk);
           audioOutputManager
             .play({ chunk: audioChunk, sessionId: sessionIdRef.current, generationId: message.generationId })
             .then(() => {
-              if (conversationStateRef.current === 'ai_speaking') {
+              pendingAudioChunksRef.current -= 1;
+              if (finalReceivedRef.current && pendingAudioChunksRef.current <= 0 && conversationStateRef.current === 'ai_speaking') {
+                resumeMic();
                 setConversationState('listening');
               }
             });
@@ -271,11 +301,24 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
       }
       case 'ai_final':
         aiResponseBufferRef.current = '';
-        // Si no llegó audio para este turno (síntesis fallida o respuesta vacía),
-        // no hay nada esperando a que termine de sonar: volvemos a "listening" ya.
-        if (!hasAudioRef.current) {
+        finalReceivedRef.current = true;
+        // Si no llegó (o ya terminó de sonar) audio para este turno, no hay nada
+        // esperando: volvemos a "listening" ya. Si todavía queda sonando, lo hace
+        // el .then() de arriba cuando termine el último chunk.
+        if (pendingAudioChunksRef.current <= 0) {
+          resumeMic();
           setConversationState('listening');
         }
+        break;
+      case 'translation':
+        setChatMessages(prev => {
+          const newMessages = [...prev];
+          const target = newMessages[message.messageIndex];
+          if (target) {
+            newMessages[message.messageIndex] = { ...target, translation: message.translatedText, isTranslating: false };
+          }
+          return newMessages;
+        });
         break;
       case 'error':
         setErrorMessage(message.message);
@@ -283,7 +326,26 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
         cleanup();
         break;
     }
-  }, [cleanup]);
+  }, [cleanup, pauseMic, resumeMic]);
+
+  const requestTranslation = useCallback((messageIndex: number) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setChatMessages(prev => {
+      const target = prev[messageIndex];
+      if (!target || target.sender !== 'ai' || !target.text || target.translation || target.isTranslating) {
+        return prev;
+      }
+      wsRef.current!.send(JSON.stringify({
+        type: 'translate',
+        text: target.text,
+        targetLanguageCode: sourceLanguage,
+        messageIndex,
+      }));
+      const newMessages = [...prev];
+      newMessages[messageIndex] = { ...target, isTranslating: true };
+      return newMessages;
+    });
+  }, [sourceLanguage]);
 
   const connectWebSocket = useCallback(() => {
     if (!authToken) {
@@ -292,7 +354,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
       return;
     }
     cleanup();
-    const url = `${process.env.NEXT_PUBLIC_WEBSOCKET_URL}?token=${authToken}&lang=${encodeURIComponent(targetLanguage)}`;
+    const url = `${process.env.NEXT_PUBLIC_WEBSOCKET_URL}?token=${authToken}&lang=${encodeURIComponent(targetLanguage)}&sourceLang=${encodeURIComponent(sourceLanguage)}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
     setConversationState('connecting');
@@ -328,7 +390,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
         setConversationState('error');
       }
     };
-  }, [authToken, cleanup, initMicrophone, handleServerMessage, targetLanguage]);
+  }, [authToken, cleanup, initMicrophone, handleServerMessage, targetLanguage, sourceLanguage]);
 
   const startConversation = useCallback(() => {
     if (conversationStateRef.current === 'idle') {
@@ -375,8 +437,10 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     lastUserTranscript,
     errorMessage,
     authExpired,
+    isMicPaused,
     startConversation,
     stopConversation,
+    requestTranslation,
     currentVolume,
   };
 };

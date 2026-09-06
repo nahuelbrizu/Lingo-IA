@@ -1,6 +1,6 @@
 // backend/src/handlers/websocketHandler.ts
 import { WebSocket } from 'ws';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { IncomingMessage } from 'http';
 import Anthropic from '@anthropic-ai/sdk';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
@@ -17,7 +17,7 @@ interface AuthTokenPayload {
 
 type ClientMessage =
   | { type: 'user_final'; text: string }
-  | { type: 'barge_in' };
+  | { type: 'translate'; text: string; targetLanguageCode: string; messageIndex: number };
 
 const CLAUDE_MODEL = 'claude-sonnet-5';
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -60,6 +60,7 @@ const SUPPORTED_LANGUAGES: Record<string, string> = {
   'zh-CN': 'Mandarin Chinese',
 };
 const DEFAULT_LANGUAGE_CODE = 'en-US';
+const DEFAULT_SOURCE_LANGUAGE_CODE = 'es-ES';
 
 export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
   console.info('Attempting to establish a new WebSocket connection...');
@@ -82,6 +83,9 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     const languageCode = requestedLangCode in SUPPORTED_LANGUAGES ? requestedLangCode : DEFAULT_LANGUAGE_CODE;
     const languageName = SUPPORTED_LANGUAGES[languageCode];
 
+    const requestedSourceLangCode = queryParams.get('sourceLang') ?? DEFAULT_SOURCE_LANGUAGE_CODE;
+    const sourceLanguageName = SUPPORTED_LANGUAGES[requestedSourceLangCode] ?? SUPPORTED_LANGUAGES[DEFAULT_SOURCE_LANGUAGE_CODE];
+
     console.log(`[AUTH DEBUG] Received token: ${token ? token.substring(0, 30) + '...' : 'No token'}`);
     console.log(`[AUTH DEBUG] NEXTAUTH_SECRET used (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`);
 
@@ -100,9 +104,9 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
     // 2. Setup Claude conversation state
     const TUTOR_SYSTEM_PROMPT =
-      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner, and only switch to the student's native language briefly if they seem completely lost. Your goal is to have a natural conversation with the user. Keep your responses concise and natural.`;
+      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural.`;
     const messages: Anthropic.MessageParam[] = [];
-    console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}).`);
+    console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}), idioma nativo: ${sourceLanguageName}.`);
 
     const send = (message: object) => {
       if (ws.readyState === ws.OPEN) {
@@ -121,9 +125,30 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         return;
       }
 
-      if (payload.type === 'barge_in') {
-        console.log(`[Claude] Barge-in recibido para User ID ${userId}. Abortando generación en curso.`);
-        currentStream?.abort();
+      if (payload.type === 'translate') {
+        const textToTranslate = payload.text?.trim();
+        if (!textToTranslate || typeof payload.messageIndex !== 'number') return;
+
+        const translateToCode = payload.targetLanguageCode in SUPPORTED_LANGUAGES
+          ? payload.targetLanguageCode
+          : DEFAULT_SOURCE_LANGUAGE_CODE;
+        const translateToName = SUPPORTED_LANGUAGES[translateToCode];
+
+        try {
+          const result = await anthropic.messages.create({
+            model: CLAUDE_MODEL,
+            max_tokens: 512,
+            system: `Translate the text the user sends into ${translateToName}. Respond with ONLY the translation — no explanations, no quotes, no extra commentary.`,
+            messages: [{ role: 'user', content: textToTranslate }],
+          });
+          const translatedText = result.content.find(
+            (block): block is Anthropic.TextBlock => block.type === 'text'
+          )?.text ?? '';
+          send({ type: 'translation', messageIndex: payload.messageIndex, translatedText });
+        } catch (translateError) {
+          console.error(`[Translate] Error for User ID ${userId}:`, translateError);
+          send({ type: 'translation', messageIndex: payload.messageIndex, translatedText: '' });
+        }
         return;
       }
 
@@ -135,6 +160,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
       try {
         messages.push({ role: 'user', content: transcript });
 
+        const generationId = randomUUID();
         const stream = anthropic.messages.stream({
           model: CLAUDE_MODEL,
           max_tokens: 1024,
@@ -144,21 +170,45 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         });
         currentStream = stream;
 
+        // Sintetizamos oración por oración a medida que Claude va escribiendo, en vez
+        // de esperar la respuesta completa: así el audio empieza a sonar mucho antes.
+        // Las llamadas a TTS se encadenan (ttsQueue) para mandar los chunks en orden.
         let fullResponseText = '';
+        let unspokenText = '';
+        let ttsQueue: Promise<void> = Promise.resolve();
+
+        const queueSpeech = (text: string) => {
+          ttsQueue = ttsQueue.then(async () => {
+            if (stream.aborted) return;
+            const audioBase64 = await synthesizeSpeech(text, languageCode);
+            if (audioBase64 && !stream.aborted && ws.readyState === ws.OPEN) {
+              send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
+            }
+          });
+        };
+
         stream.on('text', (textDelta) => {
           send({ type: 'ai_delta', text: textDelta });
           fullResponseText += textDelta;
+          unspokenText += textDelta;
+
+          // Cortamos en el límite de oración más reciente ("."/"!"/"?" seguido de
+          // espacio) y mandamos a sintetizar esa oración ya, dejando el resto
+          // (todavía incompleto) para la próxima vuelta.
+          const match = unspokenText.match(/^([\s\S]*?[.!?])(\s+)/);
+          if (match) {
+            unspokenText = unspokenText.slice(match[0].length);
+            queueSpeech(match[1].trim());
+          }
         });
 
         const finalMessage = await stream.finalMessage();
-        const generationId = createHash('sha256').update(fullResponseText).digest('hex');
 
-        if (fullResponseText.trim()) {
-          const audioBase64 = await synthesizeSpeech(fullResponseText, languageCode);
-          if (audioBase64) {
-            send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
-          }
+        if (unspokenText.trim()) {
+          queueSpeech(unspokenText.trim());
         }
+        await ttsQueue;
+
         send({ type: 'ai_final', generationId });
 
         messages.push({ role: 'assistant', content: finalMessage.content });
@@ -168,7 +218,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
       } catch (claudeError) {
         if (claudeError instanceof Anthropic.APIUserAbortError) {
-          console.log(`[Claude] Generación abortada por barge-in para User ID ${userId}.`);
+          console.log(`[Claude] Generación abortada (conexión cerrada) para User ID ${userId}.`);
         } else {
           console.error(`[Claude] Error for User ID ${userId}:`, claudeError);
           send({ type: 'error', message: 'Error procesando la respuesta de la IA.' });

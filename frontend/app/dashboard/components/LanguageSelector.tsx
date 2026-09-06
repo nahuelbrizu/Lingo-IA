@@ -4,6 +4,7 @@ import React from 'react';
 import { SUPPORTED_LANGUAGES, type LanguageCode } from '@/app/config';
 
 interface LanguageSelectorProps {
+  label: string;
   value: LanguageCode;
   onChange: (lang: LanguageCode) => void;
   disabled: boolean;
@@ -11,14 +12,15 @@ interface LanguageSelectorProps {
 
 /**
  * @description
- * Selector del idioma que se va a practicar. Deshabilitado mientras hay una
+ * Selector de idioma genérico (se reusa tanto para el idioma a practicar
+ * como para el idioma nativo del alumno). Deshabilitado mientras hay una
  * conversación activa (cambiarlo a mitad de sesión no tendría efecto hasta
  * reconectar el WebSocket, así que evitamos la confusión).
  */
-export const LanguageSelector: React.FC<LanguageSelectorProps> = ({ value, onChange, disabled }) => {
+export const LanguageSelector: React.FC<LanguageSelectorProps> = ({ label, value, onChange, disabled }) => {
   return (
     <label className="flex items-center gap-2 text-sm text-slate-600">
-      Idioma a practicar:
+      {label}
       <select
         value={value}
         disabled={disabled}

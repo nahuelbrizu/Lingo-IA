@@ -32,6 +32,9 @@ export type LanguageCode = (typeof SUPPORTED_LANGUAGES)[number]['code'];
 
 export const DEFAULT_LANGUAGE: LanguageCode = 'en-US';
 
+/** Idioma nativo del alumno por defecto (usado para las traducciones de ayuda). */
+export const DEFAULT_SOURCE_LANGUAGE: LanguageCode = 'es-ES';
+
 if (STRICT_UI_MODE) {
   console.warn(
     '%cSTRICT UI MODE ENABLED',

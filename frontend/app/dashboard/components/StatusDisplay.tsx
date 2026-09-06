@@ -28,7 +28,7 @@ export const StatusDisplay: React.FC<StatusDisplayProps> = ({
       case 'processing':
         return lastUserTranscript || 'Procesando...';
       case 'ai_speaking':
-        return 'IA está hablando...';
+        return 'IA está hablando... (micrófono en pausa)';
       case 'error':
         return 'Hubo un error en la conexión.';
       default:

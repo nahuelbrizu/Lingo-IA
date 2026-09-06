@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useSession, signOut, signIn } from 'next-auth/react';
 import { useAudioStreaming } from '@/app/hooks/useAudioStreaming';
-import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
+import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_SOURCE_LANGUAGE, type LanguageCode } from '@/app/config';
 
 // Importando los nuevos componentes con responsabilidades únicas
 import { ChatHistory } from './components/ChatHistory';
@@ -32,6 +32,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
   const [userData, setUserData] = useState(initialData);
   const [isLoadingData, setIsLoadingData] = useState(false);
   const [targetLanguage, setTargetLanguage] = useState<LanguageCode>(DEFAULT_LANGUAGE);
+  const [sourceLanguage, setSourceLanguage] = useState<LanguageCode>(DEFAULT_SOURCE_LANGUAGE);
 
   // El token de autenticación para el WebSocket ahora se extrae de forma segura.
   const authToken = (session as any)?.wsToken;
@@ -42,10 +43,12 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     lastUserTranscript,
     errorMessage,
     authExpired,
+    isMicPaused,
     startConversation,
     stopConversation,
+    requestTranslation,
     currentVolume,
-  } = useAudioStreaming(authToken, targetLanguage);
+  } = useAudioStreaming(authToken, targetLanguage, sourceLanguage);
 
   const languageLabel = SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
 
@@ -91,7 +94,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
 
       {/* Área de la conversación de IA */}
       <div className="space-y-6">
-        <ChatHistory chatMessages={chatMessages} />
+        <ChatHistory chatMessages={chatMessages} onTranslate={requestTranslation} />
         <StatusDisplay
           conversationState={conversationState}
           lastUserTranscript={lastUserTranscript}
@@ -110,8 +113,15 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
           errorMessage && <p className="text-red-500 text-center">{errorMessage}</p>
         )}
 
-        <div className="flex justify-center">
+        <div className="flex flex-wrap justify-center gap-4">
           <LanguageSelector
+            label="Idioma nativo (para traducciones):"
+            value={sourceLanguage}
+            onChange={setSourceLanguage}
+            disabled={conversationState !== 'idle'}
+          />
+          <LanguageSelector
+            label="Idioma a practicar:"
             value={targetLanguage}
             onChange={setTargetLanguage}
             disabled={conversationState !== 'idle'}
@@ -127,6 +137,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
           <VolumeVisualizer
             conversationState={conversationState}
             currentVolume={currentVolume}
+            isMicPaused={isMicPaused}
           />
         </div>
       </div>
