@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { speechOutputManager } from '@/app/services/SpeechOutputManager';
+import { audioOutputManager } from '@/app/services/AudioOutputManager';
 import { DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
 
 // ==================================================================
@@ -26,13 +26,26 @@ export type ConversationState =
 /**
  * @description
  * Mensajes que el servidor puede enviar al cliente. El reconocimiento de voz
- * ahora corre en el navegador (Web Speech API), así que el servidor ya no
- * envía transcripciones: solo la respuesta de la IA y errores.
+ * corre en el navegador (Web Speech API), así que el servidor no envía
+ * transcripciones — solo el texto de la respuesta de la IA, su audio
+ * (Google Cloud TTS) y errores.
  */
 export type ServerMessage =
   | { type: 'ai_delta'; text: string; generationId: string }
+  | { type: 'ai_audio_chunk'; chunk: string; generationId: string }
   | { type: 'ai_final'; generationId: string }
   | { type: 'error'; message: string };
+
+// --- Helper Functions ---
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
 
 /**
  * @description
@@ -63,6 +76,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
   const [lastUserTranscript, setLastUserTranscript] = useState('');
   const [currentVolume, setCurrentVolume] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
+  const [authExpired, setAuthExpired] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -74,6 +88,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
   const reconnectAttemptsRef = useRef(0);
   const aiResponseBufferRef = useRef('');
   const bargeInTriggeredRef = useRef(false);
+  const hasAudioRef = useRef(false);
   const lastUiUpdateTimeRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
   const generationIdRef = useRef<string | null>(null);
@@ -90,7 +105,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     recognitionRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
     if (audioContextRef.current?.state !== 'closed') audioContextRef.current?.close();
-    if (sessionIdRef.current) speechOutputManager.stop(sessionIdRef.current);
+    if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
     if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
@@ -119,7 +134,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     if (rms > VAD_RMS_THRESHOLD && conversationStateRef.current === 'ai_speaking' && !bargeInTriggeredRef.current) {
       bargeInTriggeredRef.current = true;
       console.log('[Barge-in] User interruption detected.');
-      if (sessionIdRef.current) speechOutputManager.stop(sessionIdRef.current);
+      if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
       if (wsRef.current && generationIdRef.current) {
         wsRef.current.send(JSON.stringify({ type: 'barge_in', generationId: generationIdRef.current }));
       }
@@ -229,6 +244,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     if ('generationId' in message && message.generationId !== generationIdRef.current) {
       generationIdRef.current = message.generationId;
       aiResponseBufferRef.current = '';
+      hasAudioRef.current = false;
     }
     switch (message.type) {
       case 'ai_delta':
@@ -239,30 +255,35 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
         }
         aiResponseBufferRef.current += message.text;
         break;
-      case 'ai_final': {
-        const textToSpeak = aiResponseBufferRef.current;
-        aiResponseBufferRef.current = '';
-
-        if (textToSpeak && sessionIdRef.current) {
-          speechOutputManager
-            .speak({ text: textToSpeak, sessionId: sessionIdRef.current, generationId: message.generationId, lang: targetLanguage })
+      case 'ai_audio_chunk': {
+        hasAudioRef.current = true;
+        if (sessionIdRef.current) {
+          const audioChunk = base64ToArrayBuffer(message.chunk);
+          audioOutputManager
+            .play({ chunk: audioChunk, sessionId: sessionIdRef.current, generationId: message.generationId })
             .then(() => {
               if (conversationStateRef.current === 'ai_speaking') {
                 setConversationState('listening');
               }
             });
-        } else {
-          setConversationState('listening');
         }
         break;
       }
+      case 'ai_final':
+        aiResponseBufferRef.current = '';
+        // Si no llegó audio para este turno (síntesis fallida o respuesta vacía),
+        // no hay nada esperando a que termine de sonar: volvemos a "listening" ya.
+        if (!hasAudioRef.current) {
+          setConversationState('listening');
+        }
+        break;
       case 'error':
         setErrorMessage(message.message);
         setConversationState('error');
         cleanup();
         break;
     }
-  }, [cleanup, targetLanguage]);
+  }, [cleanup]);
 
   const connectWebSocket = useCallback(() => {
     if (!authToken) {
@@ -293,9 +314,15 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
       } else if (event.code === 1000) {
         // Cierre normal (el propio cliente cortó la conexión vía cleanup/stopConversation).
         setConversationState('idle');
+      } else if (event.code === 4001) {
+        // El token del WebSocket venció o es inválido: no alcanza con reintentar,
+        // hace falta un token nuevo (requiere volver a loguearse).
+        console.warn('[WebSocket] Sesión expirada, se necesita volver a loguearse.');
+        setAuthExpired(true);
+        setConversationState('error');
       } else {
-        // El servidor cerró la conexión por un error (ej. token expirado). Mostrarlo
-        // en vez de resetear en silencio, para que no parezca que los botones no responden.
+        // El servidor cerró la conexión por otro error. Mostrarlo en vez de
+        // resetear en silencio, para que no parezca que los botones no responden.
         console.error(`[WebSocket] Closed with code ${event.code}: ${event.reason}`);
         setErrorMessage(event.reason || `Conexión cerrada (código ${event.code}).`);
         setConversationState('error');
@@ -309,6 +336,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
       setChatMessages([]);
       setLastUserTranscript('');
       setErrorMessage('');
+      setAuthExpired(false);
       connectWebSocket();
     }
   }, [connectWebSocket]);
@@ -346,6 +374,7 @@ export const useAudioStreaming = (authToken: string | null, targetLanguage: Lang
     chatMessages,
     lastUserTranscript,
     errorMessage,
+    authExpired,
     startConversation,
     stopConversation,
     currentVolume,

@@ -3,6 +3,7 @@ import { WebSocket } from 'ws';
 import { createHash } from 'crypto';
 import { IncomingMessage } from 'http';
 import Anthropic from '@anthropic-ai/sdk';
+import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import { prisma } from '../services/prismaService';
 import { conversationTools, summaryTool } from '../config';
 import jwt from 'jsonwebtoken';
@@ -20,6 +21,30 @@ type ClientMessage =
 
 const CLAUDE_MODEL = 'claude-sonnet-5';
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const ttsClient = new TextToSpeechClient({ apiKey: process.env.GOOGLE_CLOUD_API_KEY });
+
+/**
+ * Synthesizes text to speech using Google Cloud TTS. Returns the audio as a
+ * base64-encoded MP3 (decodable by the browser's Web Audio API directly), or
+ * null if synthesis fails — callers should treat that as "no audio this turn"
+ * rather than a fatal error.
+ */
+async function synthesizeSpeech(text: string, languageCode: string): Promise<string | null> {
+  try {
+    const [response] = await ttsClient.synthesizeSpeech({
+      input: { text },
+      voice: { languageCode },
+      audioConfig: { audioEncoding: 'MP3' },
+    });
+    if (!response.audioContent) return null;
+    return typeof response.audioContent === 'string'
+      ? response.audioContent
+      : Buffer.from(response.audioContent).toString('base64');
+  } catch (error) {
+    console.error('[TTS] Error generando audio:', error);
+    return null;
+  }
+}
 
 // Debe reflejar SUPPORTED_LANGUAGES en frontend/app/config.ts. Se valida contra
 // esta whitelist en vez de confiar en el query param crudo (va directo al
@@ -31,6 +56,8 @@ const SUPPORTED_LANGUAGES: Record<string, string> = {
   'de-DE': 'German',
   'it-IT': 'Italian',
   'pt-BR': 'Portuguese',
+  'ja-JP': 'Japanese',
+  'zh-CN': 'Mandarin Chinese',
 };
 const DEFAULT_LANGUAGE_CODE = 'en-US';
 
@@ -58,7 +85,16 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     console.log(`[AUTH DEBUG] Received token: ${token ? token.substring(0, 30) + '...' : 'No token'}`);
     console.log(`[AUTH DEBUG] NEXTAUTH_SECRET used (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`);
 
-    const decoded = jwt.verify(token, process.env.NEXTAUTH_SECRET!) as AuthTokenPayload;
+    let decoded: AuthTokenPayload;
+    try {
+      decoded = jwt.verify(token, process.env.NEXTAUTH_SECRET!) as AuthTokenPayload;
+    } catch (jwtError: any) {
+      // Código en el rango 4000-4999 (uso privado de la app) para que el
+      // frontend distinga "hay que volver a loguearse" de un error genérico.
+      console.warn(`Authentication failed: ${jwtError.message}`);
+      ws.close(4001, 'auth_expired');
+      return;
+    }
     userId = decoded.id;
     console.info(`Client authenticated and connected. User ID: ${userId}`);
 
@@ -116,6 +152,13 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
         const finalMessage = await stream.finalMessage();
         const generationId = createHash('sha256').update(fullResponseText).digest('hex');
+
+        if (fullResponseText.trim()) {
+          const audioBase64 = await synthesizeSpeech(fullResponseText, languageCode);
+          if (audioBase64) {
+            send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
+          }
+        }
         send({ type: 'ai_final', generationId });
 
         messages.push({ role: 'assistant', content: finalMessage.content });

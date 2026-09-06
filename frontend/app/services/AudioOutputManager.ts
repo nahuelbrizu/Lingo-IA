@@ -23,6 +23,7 @@ class AudioOutputManager {
   private currentSessionId: string | null = null;
   private currentGenerationId: string | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
+  private currentResolve: (() => void) | null = null;
 
   private constructor() {}
 
@@ -46,14 +47,14 @@ class AudioOutputManager {
     return this.audioContext;
   }
 
-  public async play(request: PlaybackRequest): Promise<void> {
+  public play(request: PlaybackRequest): Promise<void> {
     const { chunk, sessionId, generationId } = request;
 
     if (this.currentSessionId && this.currentSessionId !== sessionId) {
       console.warn(`[AudioOutputManager] Playback ignorado: la sesión ${this.currentSessionId} ya está activa.`);
-      return;
+      return Promise.resolve();
     }
-    
+
     if (!this.currentSessionId) {
         this.currentSessionId = sessionId;
         this.currentGenerationId = generationId;
@@ -62,49 +63,55 @@ class AudioOutputManager {
     // Guard Check 2: Prevenir que chunks de una generación obsoleta se reproduzcan.
     if (this.currentGenerationId !== generationId) {
         console.warn(`[AudioOutputManager] Playback ignorado: generationId obsoleto. Activo: ${this.currentGenerationId}, Recibido: ${generationId}`);
-        return;
+        return Promise.resolve();
     }
 
-    try {
-      const audioContext = this.getContext();
-      const audioBuffer = await audioContext.decodeAudioData(chunk.slice(0)); // Usar slice(0) para crear una copia
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-      
-      this.clearWatchdog();
+    return new Promise<void>((resolve) => {
+      this.currentResolve = resolve;
 
-      const handlePlaybackEnd = (isError: boolean = false, errorMessage?: string) => {
-        if (generationId !== this.currentGenerationId) return; // Un evento onended tardío de una generación ya cancelada
+      this.getContext()
+        .decodeAudioData(chunk.slice(0)) // Usar slice(0) para crear una copia
+        .then((audioBuffer) => {
+          const audioContext = this.getContext();
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioContext.destination);
 
-        this.clearWatchdog();
-        if (!isError) {
-          globalEventBus.publish({
-            type: 'AUDIO_PLAYBACK_ENDED',
-            sessionId: this.currentSessionId!,
-            payload: { generationId: this.currentGenerationId! }
-          });
-        } else {
-            console.error(errorMessage);
-        }
-        this.releaseLock();
-      };
+          this.clearWatchdog();
 
-      const durationMs = audioBuffer.duration * 1000;
-      this.watchdogTimer = setTimeout(() => {
-        const errorMessage = `[AudioOutputManager] WATCHDOG: Playback para sesión ${sessionId} (gen: ${generationId}) excedió el tiempo. Forzando liberación.`;
-        this.activeSource?.disconnect();
-        handlePlaybackEnd(true, errorMessage);
-      }, durationMs + PLAYBACK_TIMEOUT_MARGIN_MS);
+          const handlePlaybackEnd = (isError: boolean = false, errorMessage?: string) => {
+            if (generationId !== this.currentGenerationId) return; // Un evento onended tardío de una generación ya cancelada
 
-      source.onended = () => handlePlaybackEnd(false);
-      source.start();
+            this.clearWatchdog();
+            if (!isError) {
+              globalEventBus.publish({
+                type: 'AUDIO_PLAYBACK_ENDED',
+                sessionId: this.currentSessionId!,
+                payload: { generationId: this.currentGenerationId! }
+              });
+            } else {
+                console.error(errorMessage);
+            }
+            this.releaseLock();
+          };
 
-      this.activeSource = source;
-    } catch (error) {
-      console.error('[AudioOutputManager] Error decodificando audio. Liberando lock.', error);
-      this.releaseLock();
-    }
+          const durationMs = audioBuffer.duration * 1000;
+          this.watchdogTimer = setTimeout(() => {
+            const errorMessage = `[AudioOutputManager] WATCHDOG: Playback para sesión ${sessionId} (gen: ${generationId}) excedió el tiempo. Forzando liberación.`;
+            this.activeSource?.disconnect();
+            handlePlaybackEnd(true, errorMessage);
+          }, durationMs + PLAYBACK_TIMEOUT_MARGIN_MS);
+
+          source.onended = () => handlePlaybackEnd(false);
+          source.start();
+
+          this.activeSource = source;
+        })
+        .catch((error) => {
+          console.error('[AudioOutputManager] Error decodificando audio. Liberando lock.', error);
+          this.releaseLock();
+        });
+    });
   }
 
   public stop(sessionId?: string): void {
@@ -130,6 +137,8 @@ class AudioOutputManager {
     this.activeSource = null;
     this.currentSessionId = null;
     this.currentGenerationId = null;
+    this.currentResolve?.();
+    this.currentResolve = null;
   }
 }
 

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useSession, signOut } from 'next-auth/react';
+import { useSession, signOut, signIn } from 'next-auth/react';
 import { useAudioStreaming } from '@/app/hooks/useAudioStreaming';
 import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, type LanguageCode } from '@/app/config';
 
@@ -41,6 +41,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     chatMessages,
     lastUserTranscript,
     errorMessage,
+    authExpired,
     startConversation,
     stopConversation,
     currentVolume,
@@ -95,7 +96,19 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
           conversationState={conversationState}
           lastUserTranscript={lastUserTranscript}
         />
-        {errorMessage && <p className="text-red-500 text-center">{errorMessage}</p>}
+        {authExpired ? (
+          <div className="text-center p-4 bg-amber-50 border border-amber-200 rounded-xl">
+            <p className="text-amber-700 mb-2">Tu sesión expiró. Volvé a entrar para seguir practicando.</p>
+            <button
+              onClick={() => signIn('google')}
+              className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700"
+            >
+              Volver a iniciar sesión
+            </button>
+          </div>
+        ) : (
+          errorMessage && <p className="text-red-500 text-center">{errorMessage}</p>
+        )}
 
         <div className="flex justify-center">
           <LanguageSelector

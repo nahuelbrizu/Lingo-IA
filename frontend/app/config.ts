@@ -12,10 +12,10 @@
 export const STRICT_UI_MODE = process.env.NEXT_PUBLIC_STRICT_UI_MODE === 'true';
 
 /**
- * Idiomas que el tutor puede enseñar. El `code` es el tag BCP-47 usado tanto
- * para el reconocimiento de voz (SpeechRecognition) como para la síntesis
- * (speechSynthesis) del navegador, y se manda al backend para que Claude
- * responda en ese idioma.
+ * Idiomas que el tutor puede enseñar. El `code` es el tag BCP-47 usado para
+ * el reconocimiento de voz (SpeechRecognition) del navegador, y se manda al
+ * backend para que Claude responda en ese idioma y Google Cloud TTS
+ * sintetice la voz correspondiente.
  */
 export const SUPPORTED_LANGUAGES = [
   { code: 'en-US', label: 'Inglés' },
@@ -24,6 +24,8 @@ export const SUPPORTED_LANGUAGES = [
   { code: 'de-DE', label: 'Alemán' },
   { code: 'it-IT', label: 'Italiano' },
   { code: 'pt-BR', label: 'Portugués' },
+  { code: 'ja-JP', label: 'Japonés' },
+  { code: 'zh-CN', label: 'Chino (mandarín)' },
 ] as const;
 
 export type LanguageCode = (typeof SUPPORTED_LANGUAGES)[number]['code'];
