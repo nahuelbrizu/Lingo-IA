@@ -24,6 +24,22 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const ttsClient = new TextToSpeechClient({ apiKey: process.env.GOOGLE_CLOUD_API_KEY });
 
 /**
+ * Quita marcado de Markdown antes de mandar el texto a síntesis de voz.
+ * El texto que se muestra en el chat SÍ conserva el markdown (el frontend lo
+ * renderiza como énfasis), pero Google TTS lee los símbolos literalmente si
+ * se los mandamos tal cual ("asterisco asterisco mi nombre...").
+ */
+function stripMarkdownForSpeech(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '$1')   // **negrita**
+    .replace(/\*(.+?)\*/g, '$1')       // *cursiva*
+    .replace(/`(.+?)`/g, '$1')         // `código`
+    .replace(/^#{1,6}\s+/gm, '')       // # títulos
+    .replace(/^[-*]\s+/gm, '')         // - listas
+    .trim();
+}
+
+/**
  * Synthesizes text to speech using Google Cloud TTS. Returns the audio as a
  * base64-encoded MP3 (decodable by the browser's Web Audio API directly), or
  * null if synthesis fails — callers should treat that as "no audio this turn"
@@ -180,7 +196,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         const queueSpeech = (text: string) => {
           ttsQueue = ttsQueue.then(async () => {
             if (stream.aborted) return;
-            const audioBase64 = await synthesizeSpeech(text, languageCode);
+            const audioBase64 = await synthesizeSpeech(stripMarkdownForSpeech(text), languageCode);
             if (audioBase64 && !stream.aborted && ws.readyState === ws.OPEN) {
               send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
             }
