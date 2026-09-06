@@ -103,6 +103,7 @@ export const useAudioStreaming = (
   const micPausedRef = useRef(false);
   const turnBufferRef = useRef('');
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const consecutiveRecognitionErrorsRef = useRef(0);
   const reconnectAttemptsRef = useRef(0);
   const aiResponseBufferRef = useRef('');
   const hasAudioRef = useRef(false);
@@ -127,6 +128,7 @@ export const useAudioStreaming = (
       silenceTimerRef.current = null;
     }
     turnBufferRef.current = '';
+    consecutiveRecognitionErrorsRef.current = 0;
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     recognitionRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
@@ -223,6 +225,7 @@ export const useAudioStreaming = (
     recognition.interimResults = true;
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
+      consecutiveRecognitionErrorsRef.current = 0;
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         const transcript = result[0]?.transcript ?? '';
@@ -254,11 +257,24 @@ export const useAudioStreaming = (
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
       if (event.error === 'no-speech' || event.error === 'aborted') return;
-      console.error('[SpeechRecognition] Error:', event.error);
+      console.error('[SpeechRecognition] Error:', event.error, event.message);
+
       if (event.error === 'not-allowed' || event.error === 'audio-capture') {
         setErrorMessage('Microphone permission denied.');
         setConversationState('error');
         cleanup();
+        return;
+      }
+
+      // Otros errores (p.ej. "network", muy común en Chrome/Android cuando el
+      // motor de reconocimiento en la nube de Google falla) antes se tragaban
+      // en silencio y el reconocimiento reintentaba para siempre sin avisar
+      // nada. Si se repite varias veces seguidas sin reconocer nada, avisamos.
+      consecutiveRecognitionErrorsRef.current += 1;
+      if (consecutiveRecognitionErrorsRef.current >= 3) {
+        setErrorMessage(
+          `El reconocimiento de voz está fallando ("${event.error}"). Revisá tu conexión, o que la app de Google tenga permiso de micrófono en los ajustes del sistema.`
+        );
       }
     };
 
