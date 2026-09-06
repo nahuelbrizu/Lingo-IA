@@ -1,7 +1,7 @@
 // frontend/app/hooks/useConversation/services/SessionOrchestrator.ts
 
 import { v4 as uuidv4 } from 'uuid';
-import { GlobalEvent, Command } from '../types';
+import { GlobalEvent, BaseCommand as Command } from '../types';
 import { fsmReducer, FSMState } from '../FSM';
 import { TTSService } from './TTSService';
 import { audioOutputManager } from '../../../services/AudioOutputManager';

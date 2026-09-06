@@ -10,6 +10,7 @@
 export interface GlobalEvent {
   type: string;
   sessionId?: string; // Opcional para eventos de broadcast como los de audio
+  generationId?: string; // Para correlacionar eventos de una misma respuesta de IA
   payload?: any;
   timestamp: number;
 }

@@ -65,6 +65,15 @@ export interface ChatMessage {
 const MAX_RECONNECT_DELAY = 30000;
 /** Intervalo para el throttling de actualizaciones de la UI para el texto de la IA (en ms). */
 const AI_TEXT_THROTTLE_MS = 50;
+/**
+ * Silencio (en ms) que esperamos antes de dar por terminado el turno del
+ * usuario. El SpeechRecognition del navegador tiene su propio detector de fin
+ * de frase (no configurable, suele ser bastante más corto), así que no
+ * mandamos sus resultados "final" directo al backend: acumulamos el texto y
+ * esperamos este silencio real antes de cortar, para no interrumpir a mitad
+ * de una pausa natural del usuario.
+ */
+const USER_SILENCE_TIMEOUT_MS = 2000;
 
 
 // ==================================================================
@@ -92,6 +101,8 @@ export const useAudioStreaming = (
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const shouldRecognizeRef = useRef(false);
   const micPausedRef = useRef(false);
+  const turnBufferRef = useRef('');
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const aiResponseBufferRef = useRef('');
   const hasAudioRef = useRef(false);
@@ -111,6 +122,11 @@ export const useAudioStreaming = (
     shouldRecognizeRef.current = false;
     micPausedRef.current = false;
     setIsMicPaused(false);
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    turnBufferRef.current = '';
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     recognitionRef.current?.stop();
     mediaStreamRef.current?.getTracks().forEach(track => track.stop());
@@ -140,6 +156,13 @@ export const useAudioStreaming = (
     animationFrameRef.current = requestAnimationFrame(analyseAudio);
   }, []);
 
+  const clearSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
+
   /**
    * El SpeechRecognition del navegador captura el micrófono con su propio
    * pipeline de audio interno — no respeta el `echoCancellation` que le
@@ -152,8 +175,10 @@ export const useAudioStreaming = (
     if (micPausedRef.current) return;
     micPausedRef.current = true;
     setIsMicPaused(true);
+    clearSilenceTimer();
+    turnBufferRef.current = '';
     recognitionRef.current?.stop();
-  }, []);
+  }, [clearSilenceTimer]);
 
   const resumeMic = useCallback(() => {
     if (!micPausedRef.current) return;
@@ -203,12 +228,27 @@ export const useAudioStreaming = (
         const transcript = result[0]?.transcript ?? '';
         if (!transcript) continue;
 
+        // El "final" del propio navegador no dispara el envío al toque: solo
+        // vamos acumulando el texto confirmado y reiniciando el temporizador
+        // de silencio en cada actividad (final o interina). Recién cuando
+        // pasan USER_SILENCE_TIMEOUT_MS sin ninguna novedad, se considera que
+        // el usuario terminó de hablar.
         if (result.isFinal) {
-          console.log(`[SpeechRecognition] Final transcript: "${transcript}"`);
-          sendUserFinalTranscript(transcript.trim());
+          turnBufferRef.current = `${turnBufferRef.current} ${transcript}`.trim();
+          setLastUserTranscript(turnBufferRef.current);
         } else {
-          setLastUserTranscript(transcript + '...');
+          setLastUserTranscript(`${turnBufferRef.current} ${transcript}`.trim() + '...');
         }
+
+        clearSilenceTimer();
+        silenceTimerRef.current = setTimeout(() => {
+          const finalText = turnBufferRef.current.trim();
+          turnBufferRef.current = '';
+          if (finalText) {
+            console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio: "${finalText}"`);
+            sendUserFinalTranscript(finalText);
+          }
+        }, USER_SILENCE_TIMEOUT_MS);
       }
     };
 
@@ -234,7 +274,7 @@ export const useAudioStreaming = (
     recognitionRef.current = recognition;
     shouldRecognizeRef.current = true;
     recognition.start();
-  }, [cleanup, sendUserFinalTranscript, targetLanguage]);
+  }, [cleanup, clearSilenceTimer, sendUserFinalTranscript, targetLanguage]);
 
   const initMicrophone = useCallback(async () => {
     try {
