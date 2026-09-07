@@ -97,6 +97,12 @@ export const useAudioStreaming = (
   const shouldRecognizeRef = useRef(false);
   const micPausedRef = useRef(false);
   const turnBufferRef = useRef('');
+  // Texto confirmado ("final") de la sesión de reconocimiento actual, indexado
+  // por posición. En Android el motor a veces marca el mismo índice como
+  // "final" varias veces, cada una con el texto revisado/más largo (p.ej.
+  // "yes" → "yes my" → "yes my day"...); guardar por índice y sobrescribir en
+  // vez de ir pegando cada aviso evita que eso se duplique en "telescopio".
+  const sessionFinalSegmentsRef = useRef<string[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const consecutiveRecognitionErrorsRef = useRef(0);
   const reconnectAttemptsRef = useRef(0);
@@ -123,6 +129,7 @@ export const useAudioStreaming = (
       silenceTimerRef.current = null;
     }
     turnBufferRef.current = '';
+    sessionFinalSegmentsRef.current = [];
     consecutiveRecognitionErrorsRef.current = 0;
     recognitionRef.current?.stop();
     if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
@@ -155,6 +162,7 @@ export const useAudioStreaming = (
     setIsMicPaused(true);
     clearSilenceTimer();
     turnBufferRef.current = '';
+    sessionFinalSegmentsRef.current = [];
     recognitionRef.current?.stop();
   }, [clearSilenceTimer]);
 
@@ -210,33 +218,44 @@ export const useAudioStreaming = (
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       consecutiveRecognitionErrorsRef.current = 0;
+      let latestInterim = '';
+
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         const transcript = result[0]?.transcript ?? '';
         if (!transcript) continue;
 
-        // El "final" del propio navegador no dispara el envío al toque: solo
-        // vamos acumulando el texto confirmado y reiniciando el temporizador
-        // de silencio en cada actividad (final o interina). Recién cuando
-        // pasan USER_SILENCE_TIMEOUT_MS sin ninguna novedad, se considera que
-        // el usuario terminó de hablar.
         if (result.isFinal) {
-          turnBufferRef.current = `${turnBufferRef.current} ${transcript}`.trim();
-          setLastUserTranscript(turnBufferRef.current);
+          // Sobrescribimos la posición i en vez de pegar al final: si el
+          // motor vuelve a marcar este mismo índice como final más tarde
+          // (con el texto revisado), reemplaza la versión vieja en vez de
+          // sumarse a ella.
+          sessionFinalSegmentsRef.current[i] = transcript.trim();
         } else {
-          setLastUserTranscript(`${turnBufferRef.current} ${transcript}`.trim() + '...');
+          latestInterim = transcript;
         }
-
-        clearSilenceTimer();
-        silenceTimerRef.current = setTimeout(() => {
-          const finalText = turnBufferRef.current.trim();
-          turnBufferRef.current = '';
-          if (finalText) {
-            console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio (${finalText.length} caracteres).`);
-            sendUserFinalTranscript(finalText);
-          }
-        }, USER_SILENCE_TIMEOUT_MS);
       }
+
+      const sessionFinalText = sessionFinalSegmentsRef.current.filter(Boolean).join(' ');
+      const combined = `${turnBufferRef.current} ${sessionFinalText}`.trim();
+
+      // El "final" del propio navegador no dispara el envío al toque: solo
+      // vamos acumulando el texto confirmado y reiniciando el temporizador
+      // de silencio en cada actividad (final o interina). Recién cuando
+      // pasan USER_SILENCE_TIMEOUT_MS sin ninguna novedad, se considera que
+      // el usuario terminó de hablar.
+      setLastUserTranscript(latestInterim ? `${combined} ${latestInterim}`.trim() + '...' : combined);
+
+      clearSilenceTimer();
+      silenceTimerRef.current = setTimeout(() => {
+        const finalText = combined;
+        turnBufferRef.current = '';
+        sessionFinalSegmentsRef.current = [];
+        if (finalText) {
+          console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio (${finalText.length} caracteres).`);
+          sendUserFinalTranscript(finalText);
+        }
+      }, USER_SILENCE_TIMEOUT_MS);
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -263,9 +282,17 @@ export const useAudioStreaming = (
     };
 
     // El reconocimiento continuo del navegador se corta solo cada tanto
-    // (silencios largos, límites internos); lo reiniciamos mientras la
-    // conversación siga activa y no esté pausado a propósito (IA hablando).
+    // (silencios largos, límites internos, a veces a mitad de una frase);
+    // lo reiniciamos mientras la conversación siga activa y no esté pausado
+    // a propósito (IA hablando). La sesión nueva vuelve a numerar sus
+    // resultados desde 0, así que "comprometemos" lo ya confirmado de esta
+    // sesión al acumulado del turno antes de resetear, para no perderlo.
     recognition.onend = () => {
+      const sessionFinalText = sessionFinalSegmentsRef.current.filter(Boolean).join(' ');
+      if (sessionFinalText) {
+        turnBufferRef.current = `${turnBufferRef.current} ${sessionFinalText}`.trim();
+      }
+      sessionFinalSegmentsRef.current = [];
       if (shouldRecognizeRef.current && !micPausedRef.current) {
         recognition.start();
       }
