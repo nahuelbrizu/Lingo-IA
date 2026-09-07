@@ -177,7 +177,7 @@ export const useAudioStreaming = (
     // a la vez pisan el buffer de texto de la otra y la síntesis de voz
     // termina sin nada que decir.
     if (conversationStateRef.current !== 'listening') {
-      console.log(`[SpeechRecognition] Ignorado (la IA está ocupada): "${text}"`);
+      console.log('[SpeechRecognition] Ignorado (la IA está ocupada).');
       return;
     }
     wsRef.current.send(JSON.stringify({ type: 'user_final', text }));
@@ -232,7 +232,7 @@ export const useAudioStreaming = (
           const finalText = turnBufferRef.current.trim();
           turnBufferRef.current = '';
           if (finalText) {
-            console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio: "${finalText}"`);
+            console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio (${finalText.length} caracteres).`);
             sendUserFinalTranscript(finalText);
           }
         }, USER_SILENCE_TIMEOUT_MS);

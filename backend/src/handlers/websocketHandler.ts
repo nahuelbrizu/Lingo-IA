@@ -102,9 +102,6 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     const requestedSourceLangCode = queryParams.get('sourceLang') ?? DEFAULT_SOURCE_LANGUAGE_CODE;
     const sourceLanguageName = SUPPORTED_LANGUAGES[requestedSourceLangCode] ?? SUPPORTED_LANGUAGES[DEFAULT_SOURCE_LANGUAGE_CODE];
 
-    console.log(`[AUTH DEBUG] Received token: ${token ? token.substring(0, 30) + '...' : 'No token'}`);
-    console.log(`[AUTH DEBUG] NEXTAUTH_SECRET used (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`);
-
     let decoded: AuthTokenPayload;
     try {
       decoded = jwt.verify(token, process.env.NEXTAUTH_SECRET!) as AuthTokenPayload;
@@ -171,7 +168,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
       if (payload.type !== 'user_final' || !payload.text?.trim()) return;
       const transcript = payload.text.trim();
 
-      console.log(`[Transcript] Final transcript for User ID ${userId}: "${transcript}"`);
+      console.log(`[Transcript] Final transcript received for User ID ${userId} (${transcript.length} chars).`);
 
       try {
         messages.push({ role: 'user', content: transcript });

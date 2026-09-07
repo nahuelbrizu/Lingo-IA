@@ -11,7 +11,6 @@ declare global {
 }
 
 const connectionString = process.env.DATABASE_URL;
-console.log(`[DB DEBUG] DATABASE_URL used (partial): ${connectionString ? connectionString.substring(0, 30) + '...' + connectionString.substring(connectionString.length - 10) : 'MISSING'}`); // TEMPORARY DEBUG LOG
 const pool = new Pool({ connectionString });
 const adapter = new PrismaPg(pool);
 
@@ -20,7 +19,7 @@ export const prisma =
   new PrismaClient({
     // @ts-ignore
     adapter,
-    log: ['query', 'info', 'warn', 'error'],
+    log: ['error'],
   });
 
 if (process.env.NODE_ENV !== 'production') {

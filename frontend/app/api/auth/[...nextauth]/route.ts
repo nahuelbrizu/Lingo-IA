@@ -34,7 +34,6 @@ export const authOptions: AuthOptions = {
       // We are creating a separate, short-lived JWT for WebSocket authentication.
       if (user) {
         token.id = user.id;
-        console.log(`[AUTH DEBUG] Frontend NEXTAUTH_SECRET used for signing (partial): ${process.env.NEXTAUTH_SECRET ? process.env.NEXTAUTH_SECRET.substring(0, 5) + '...' + process.env.NEXTAUTH_SECRET.substring(process.env.NEXTAUTH_SECRET.length - 5) : 'MISSING'}`); // TEMPORARY DEBUG LOG
         const wsToken = jwt.sign({ id: user.id }, process.env.NEXTAUTH_SECRET!, {
           expiresIn: '1h', // Or a duration suitable for your sessions
         });
