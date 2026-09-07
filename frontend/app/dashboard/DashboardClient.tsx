@@ -47,7 +47,6 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     startConversation,
     stopConversation,
     requestTranslation,
-    currentVolume,
   } = useAudioStreaming(authToken, targetLanguage, sourceLanguage);
 
   const languageLabel = SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
@@ -136,7 +135,6 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
           />
           <VolumeVisualizer
             conversationState={conversationState}
-            currentVolume={currentVolume}
             isMicPaused={isMicPaused}
           />
         </div>

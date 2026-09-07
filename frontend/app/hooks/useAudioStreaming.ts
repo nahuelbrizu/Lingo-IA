@@ -88,16 +88,11 @@ export const useAudioStreaming = (
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [lastUserTranscript, setLastUserTranscript] = useState('');
-  const [currentVolume, setCurrentVolume] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
   const [authExpired, setAuthExpired] = useState(false);
   const [isMicPaused, setIsMicPaused] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const analyserNodeRef = useRef<AnalyserNode | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const shouldRecognizeRef = useRef(false);
   const micPausedRef = useRef(false);
@@ -129,33 +124,14 @@ export const useAudioStreaming = (
     }
     turnBufferRef.current = '';
     consecutiveRecognitionErrorsRef.current = 0;
-    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     recognitionRef.current?.stop();
-    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
-    if (audioContextRef.current?.state !== 'closed') audioContextRef.current?.close();
     if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
     if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
     }
     wsRef.current = null;
-    audioContextRef.current = null;
-    mediaStreamRef.current = null;
     recognitionRef.current = null;
-    animationFrameRef.current = null;
-  }, []);
-
-  const analyseAudio = useCallback(() => {
-    if (!analyserNodeRef.current) return;
-    const dataArray = new Float32Array(analyserNodeRef.current.fftSize);
-    analyserNodeRef.current.getFloatTimeDomainData(dataArray);
-    let sumOfSquares = 0;
-    for (let i = 0; i < dataArray.length; i++) {
-      sumOfSquares += dataArray[i] * dataArray[i];
-    }
-    const rms = Math.sqrt(sumOfSquares / dataArray.length);
-    setCurrentVolume(rms);
-    animationFrameRef.current = requestAnimationFrame(analyseAudio);
   }, []);
 
   const clearSilenceTimer = useCallback(() => {
@@ -224,6 +200,14 @@ export const useAudioStreaming = (
     recognition.continuous = true;
     recognition.interimResults = true;
 
+    // Diagnóstico: confirma si el motor de reconocimiento realmente llegó a
+    // engancharse al micrófono (onaudiostart) o si se queda "escuchando" sin
+    // recibir nada — sirve para distinguir un problema de permisos/hardware
+    // de uno de reconocimiento en sí.
+    recognition.onstart = () => console.log('[SpeechRecognition] onstart');
+    recognition.onaudiostart = () => console.log('[SpeechRecognition] onaudiostart (motor conectado al micrófono)');
+    recognition.onsoundstart = () => console.log('[SpeechRecognition] onsoundstart (detectó sonido)');
+
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       consecutiveRecognitionErrorsRef.current = 0;
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -291,31 +275,6 @@ export const useAudioStreaming = (
     shouldRecognizeRef.current = true;
     recognition.start();
   }, [cleanup, clearSilenceTimer, sendUserFinalTranscript, targetLanguage]);
-
-  const initMicrophone = useCallback(async () => {
-    try {
-      // Pedimos cancelación de eco explícita: sin esto, el micrófono capta el
-      // propio audio de la síntesis de voz de la IA saliendo por los parlantes
-      // y lo interpreta como que el usuario la está interrumpiendo (barge-in falso).
-      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      if (audioContextRef.current.state === 'suspended') {
-        await audioContextRef.current.resume();
-      }
-      const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
-      analyserNodeRef.current = audioContextRef.current.createAnalyser();
-      analyserNodeRef.current.fftSize = 2048;
-      source.connect(analyserNodeRef.current);
-      initSpeechRecognition();
-      animationFrameRef.current = requestAnimationFrame(analyseAudio);
-    } catch (error: any) {
-      setErrorMessage(error.name === 'NotAllowedError' ? 'Microphone permission denied.' : 'No microphone found.');
-      setConversationState('error');
-      cleanup();
-    }
-  }, [analyseAudio, cleanup, initSpeechRecognition]);
 
   const handleServerMessage = useCallback((event: MessageEvent) => {
     const message: ServerMessage = JSON.parse(event.data);
@@ -418,7 +377,7 @@ export const useAudioStreaming = (
       console.log('[WebSocket] Connection established.');
       setConversationState('listening');
       reconnectAttemptsRef.current = 0;
-      initMicrophone();
+      initSpeechRecognition();
     };
     ws.onmessage = handleServerMessage;
     ws.onerror = () => { setErrorMessage('Connection error.'); setConversationState('error'); };
@@ -446,7 +405,7 @@ export const useAudioStreaming = (
         setConversationState('error');
       }
     };
-  }, [authToken, cleanup, initMicrophone, handleServerMessage, targetLanguage, sourceLanguage]);
+  }, [authToken, cleanup, initSpeechRecognition, handleServerMessage, targetLanguage, sourceLanguage]);
 
   const startConversation = useCallback(() => {
     if (conversationStateRef.current === 'idle') {
@@ -497,6 +456,5 @@ export const useAudioStreaming = (
     startConversation,
     stopConversation,
     requestTranslation,
-    currentVolume,
   };
 };
