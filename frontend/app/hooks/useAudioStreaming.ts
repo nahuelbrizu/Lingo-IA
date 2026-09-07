@@ -75,11 +75,28 @@ function mergeFinalSegment(current: string, incoming: string): string {
  * Representa un mensaje en el historial del chat.
  */
 export interface ChatMessage {
-  sender: 'user' | 'ai';
+  sender: 'user' | 'ai' | 'system';
   text: string;
   translation?: string;
   isTranslating?: boolean;
 }
+
+/**
+ * Mensaje de bienvenida que se agrega solo (del lado del cliente, sin pasar
+ * por el backend) al arrancar cada sesión, para que quede claro que esto es
+ * un chat de voz y cómo funcionan los turnos — sobre todo el silencio que
+ * hay que dejar para que la IA entienda que uno terminó de hablar.
+ */
+const WELCOME_MESSAGE: ChatMessage = {
+  sender: 'system',
+  text:
+    'Bienvenido a Lingo AI 👋 Este es un chat de voz: hablá con naturalidad y, ' +
+    'cuando termines de decir algo, hacé una pausa de unos 3 segundos de ' +
+    'silencio para que la IA sepa que te toca escuchar. Mientras la IA está ' +
+    'respondiendo el micrófono queda en pausa (el ícono parpadea) y se ' +
+    'reactiva solo cuando termina de hablar. Si no entendés una respuesta, ' +
+    'tocá "Traducir" debajo del mensaje para verla en tu idioma nativo.',
+};
 
 // --- Constantes de configuración ---
 
@@ -94,9 +111,10 @@ const AI_TEXT_THROTTLE_MS = 50;
  * mandamos sus resultados "final" directo al backend: acumulamos el texto y
  * esperamos este silencio real antes de cortar, para no interrumpir a mitad
  * de una pausa natural del usuario. 2 segundos resultaba muy poco cuando el
- * usuario tarda en pensar/seguir hablando y cortaba el turno de golpe.
+ * usuario tarda en pensar/seguir hablando y cortaba el turno de golpe; 4
+ * quedaba largo para la conversación. 3 es el punto intermedio.
  */
-const USER_SILENCE_TIMEOUT_MS = 4000;
+const USER_SILENCE_TIMEOUT_MS = 3000;
 
 
 // ==================================================================
@@ -334,9 +352,17 @@ export const useAudioStreaming = (
 
   const handleServerMessage = useCallback((event: MessageEvent) => {
     const message: ServerMessage = JSON.parse(event.data);
+    // OJO: el backend NO manda generationId en "ai_delta" (solo en
+    // ai_audio_chunk/ai_final), así que este chequeo recién dispara cuando
+    // llega el primer chunk de audio de un turno nuevo — momento en el que ya
+    // se acumuló texto de varios deltas. Por eso el reset de
+    // aiResponseBufferRef NO va acá (antes vivía acá y borraba a mitad de
+    // turno el texto ya mostrado en el chat, mientras la voz seguía leyendo
+    // la respuesta completa — de ahí que el chat mostrara menos texto que el
+    // que se escuchaba). Ese reset ahora se hace en el momento correcto: al
+    // arrancar el turno nuevo, en el propio "ai_delta".
     if ('generationId' in message && message.generationId !== generationIdRef.current) {
       generationIdRef.current = message.generationId;
-      aiResponseBufferRef.current = '';
       hasAudioRef.current = false;
       pendingAudioChunksRef.current = 0;
       finalReceivedRef.current = false;
@@ -346,6 +372,7 @@ export const useAudioStreaming = (
         if (conversationStateRef.current !== 'ai_speaking') {
           pauseMic();
           setConversationState('ai_speaking');
+          aiResponseBufferRef.current = '';
           setChatMessages(prev => [...prev, { sender: 'ai', text: '' }]);
         }
         aiResponseBufferRef.current += message.text;
@@ -466,7 +493,7 @@ export const useAudioStreaming = (
   const startConversation = useCallback(() => {
     if (conversationStateRef.current === 'idle') {
       sessionIdRef.current = uuidv4();
-      setChatMessages([]);
+      setChatMessages([WELCOME_MESSAGE]);
       setLastUserTranscript('');
       setErrorMessage('');
       setAuthExpired(false);

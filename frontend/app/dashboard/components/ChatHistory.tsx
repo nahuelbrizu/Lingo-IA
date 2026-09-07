@@ -83,6 +83,13 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
     <div className="mb-6 p-4 bg-white rounded-2xl shadow-lg border border-slate-100 h-96 overflow-y-auto">
       <div className="space-y-4">
         {chatMessages.map((msg, index) => (
+          msg.sender === 'system' ? (
+            <div key={index} className="flex justify-center">
+              <p className="max-w-sm md:max-w-md text-center text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 leading-relaxed whitespace-pre-wrap">
+                {msg.text}
+              </p>
+            </div>
+          ) : (
           <div
             key={index}
             className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}
@@ -117,6 +124,7 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
               </div>
             )}
           </div>
+          )
         ))}
         <div ref={messagesEndRef} />
       </div>
