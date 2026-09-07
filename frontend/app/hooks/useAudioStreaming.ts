@@ -127,7 +127,11 @@ export const useAudioStreaming = (
   sourceLanguage: LanguageCode = DEFAULT_SOURCE_LANGUAGE
 ) => {
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  // Arranca ya con el mensaje de bienvenida (ver WELCOME_MESSAGE) para que el
+  // usuario lo lea ANTES de tocar "empezar" — si se agregaba recién al
+  // arrancar la conversación, aparecía justo cuando el usuario ya estaba por
+  // hablar y no llegaba a leerlo.
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
   const [lastUserTranscript, setLastUserTranscript] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [authExpired, setAuthExpired] = useState(false);
