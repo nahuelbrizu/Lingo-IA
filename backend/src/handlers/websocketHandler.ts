@@ -211,16 +211,27 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
           });
         };
 
+        // Límite de oración para cortar y mandar a sintetizar en cuanto está lista,
+        // sin esperar el resto de la respuesta. Dos variantes:
+        // - Punto (".") seguido de espacio: solo en ese caso exigimos el espacio,
+        //   para no cortar en medio de un número (3.14) o abreviatura (Mr.).
+        // - Signos de exclamación/interrogación, ASCII o de ancho completo
+        //   (!?。！？): son inequívocos como fin de oración, así que no hace falta
+        //   que los siga un espacio. Esto es clave para japonés y chino, que no
+        //   separan oraciones con espacios — exigir uno (como hacíamos antes)
+        //   hacía que la regex nunca matcheara en esos idiomas y toda la
+        //   respuesta se mandara a hablar de una sola vez al final, sin
+        //   streaming oración por oración. El "+" junta signos repetidos
+        //   ("?!", "！？") en un solo corte en vez de trocearlos.
+        const SENTENCE_BOUNDARY = /^([\s\S]*?(?:[.]\s+|[!?。！？]+\s*))/;
+
         stream.on('text', (textDelta) => {
           send({ type: 'ai_delta', text: textDelta });
           fullResponseText += textDelta;
           unspokenText += textDelta;
 
-          // Cortamos en el límite de oración más reciente ("."/"!"/"?" seguido de
-          // espacio) y mandamos a sintetizar esa oración ya, dejando el resto
-          // (todavía incompleto) para la próxima vuelta.
-          const match = unspokenText.match(/^([\s\S]*?[.!?])(\s+)/);
-          if (match) {
+          let match;
+          while ((match = unspokenText.match(SENTENCE_BOUNDARY))) {
             unspokenText = unspokenText.slice(match[0].length);
             queueSpeech(match[1].trim());
           }
