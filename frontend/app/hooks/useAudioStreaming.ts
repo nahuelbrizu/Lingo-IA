@@ -93,9 +93,10 @@ const AI_TEXT_THROTTLE_MS = 50;
  * de frase (no configurable, suele ser bastante más corto), así que no
  * mandamos sus resultados "final" directo al backend: acumulamos el texto y
  * esperamos este silencio real antes de cortar, para no interrumpir a mitad
- * de una pausa natural del usuario.
+ * de una pausa natural del usuario. 2 segundos resultaba muy poco cuando el
+ * usuario tarda en pensar/seguir hablando y cortaba el turno de golpe.
  */
-const USER_SILENCE_TIMEOUT_MS = 2000;
+const USER_SILENCE_TIMEOUT_MS = 4000;
 
 
 // ==================================================================
