@@ -29,6 +29,15 @@ const ttsClient = new TextToSpeechClient({ apiKey: process.env.GOOGLE_CLOUD_API_
  * renderiza como énfasis), pero Google TTS lee los símbolos literalmente si
  * se los mandamos tal cual ("asterisco asterisco mi nombre...").
  */
+// Rango amplio de pictogramas/emoji (incluye modificadores de tono de piel,
+// variation selectors y el Zero Width Joiner usado en emoji compuestos como
+// 👨‍👩‍👧). Google TTS no los ignora en silencio: muchos los lee en voz alta
+// (el nombre del símbolo), y como el chat de texto SÍ puede llegar a
+// mostrarlos "invisibles" según la fuente, el resultado es una voz que
+// menciona algo que el usuario ni ve escrito.
+const EMOJI_PATTERN =
+  /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu;
+
 function stripMarkdownForSpeech(text: string): string {
   return text
     .replace(/\*\*(.+?)\*\*/g, '$1')   // **negrita**
@@ -36,6 +45,8 @@ function stripMarkdownForSpeech(text: string): string {
     .replace(/`(.+?)`/g, '$1')         // `código`
     .replace(/^#{1,6}\s+/gm, '')       // # títulos
     .replace(/^[-*]\s+/gm, '')         // - listas
+    .replace(EMOJI_PATTERN, '')        // emojis (ver EMOJI_PATTERN)
+    .replace(/[ \t]{2,}/g, ' ')        // colapsa espacios que deja el emoji removido
     .trim();
 }
 
@@ -117,7 +128,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
     // 2. Setup Claude conversation state
     const TUTOR_SYSTEM_PROMPT =
-      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural.`;
+      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation: never use emojis or other pictographic symbols in your responses.`;
     const messages: Anthropic.MessageParam[] = [];
     console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}), idioma nativo: ${sourceLanguageName}.`);
 
