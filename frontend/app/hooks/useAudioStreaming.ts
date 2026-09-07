@@ -229,7 +229,16 @@ export const useAudioStreaming = (
 
     const recognition = new SpeechRecognitionCtor();
     recognition.lang = targetLanguage;
-    recognition.continuous = true;
+    // false a propósito: el modo continuo de Android es poco confiable — el
+    // motor va "revisando" el mismo resultado final varias veces de formas
+    // impredecibles (a veces reemplazando, a veces no), lo que termina
+    // duplicando texto sin importar cómo tratemos de compararlo. En modo no
+    // continuo, cada sesión reconoce UNA frase y da UN solo resultado final
+    // antes de terminar; nuestro propio onend la reinicia enseguida para la
+    // frase siguiente, así que seguimos escuchando de forma continua desde
+    // el punto de vista del usuario, sin heredar los problemas del modo
+    // continuo nativo.
+    recognition.continuous = false;
     recognition.interimResults = true;
 
     // Diagnóstico: confirma si el motor de reconocimiento realmente llegó a
@@ -300,10 +309,11 @@ export const useAudioStreaming = (
       }
     };
 
-    // El reconocimiento continuo del navegador se corta solo cada tanto
-    // (silencios largos, límites internos, a veces a mitad de una frase);
-    // lo reiniciamos mientras la conversación siga activa y no esté pausado
-    // a propósito (IA hablando). La sesión nueva vuelve a numerar sus
+    // Con continuous=false, cada sesión termina sola apenas reconoce UNA
+    // frase (o si no detectó voz). La reiniciamos al toque para la frase
+    // siguiente mientras la conversación siga activa y no esté pausada a
+    // propósito (IA hablando) — desde el punto de vista del usuario sigue
+    // escuchando de forma continua. La sesión nueva vuelve a numerar sus
     // resultados desde 0, así que "comprometemos" lo ya confirmado de esta
     // sesión al acumulado del turno antes de resetear, para no perderlo.
     recognition.onend = () => {
