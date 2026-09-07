@@ -49,6 +49,28 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 }
 
 /**
+ * Combina un resultado "final" nuevo del reconocimiento con lo que ya
+ * teníamos, por contenido en vez de por posición/índice:
+ * - Si el nuevo texto empieza con el que ya teníamos, es una revisión más
+ *   larga de la misma frase → lo reemplaza.
+ * - Si el que ya teníamos empieza con el nuevo, el nuevo es una versión
+ *   vieja/más corta que llegó tarde → se ignora.
+ * - Si no se relacionan, es un fragmento realmente nuevo → se agrega.
+ */
+function mergeFinalSegment(current: string, incoming: string): string {
+  const currentNorm = current.trim();
+  const incomingNorm = incoming.trim();
+  if (!currentNorm) return incomingNorm;
+  if (!incomingNorm) return currentNorm;
+
+  const currentLower = currentNorm.toLowerCase();
+  const incomingLower = incomingNorm.toLowerCase();
+  if (incomingLower.startsWith(currentLower)) return incomingNorm;
+  if (currentLower.startsWith(incomingLower)) return currentNorm;
+  return `${currentNorm} ${incomingNorm}`.trim();
+}
+
+/**
  * @description
  * Representa un mensaje en el historial del chat.
  */
@@ -97,12 +119,14 @@ export const useAudioStreaming = (
   const shouldRecognizeRef = useRef(false);
   const micPausedRef = useRef(false);
   const turnBufferRef = useRef('');
-  // Texto confirmado ("final") de la sesión de reconocimiento actual, indexado
-  // por posición. En Android el motor a veces marca el mismo índice como
-  // "final" varias veces, cada una con el texto revisado/más largo (p.ej.
-  // "yes" → "yes my" → "yes my day"...); guardar por índice y sobrescribir en
-  // vez de ir pegando cada aviso evita que eso se duplique en "telescopio".
-  const sessionFinalSegmentsRef = useRef<string[]>([]);
+  // Texto confirmado ("final") de la sesión de reconocimiento actual. En
+  // Android el motor va revisando la misma frase en varios avisos "final"
+  // sucesivos, cada uno más largo que el anterior (p.ej. "yes" → "yes my" →
+  // "yes my day"...), y no necesariamente reutiliza el mismo índice — así que
+  // en vez de confiar en la posición, comparamos contenido: si el nuevo aviso
+  // empieza con lo que ya teníamos, es una revisión y reemplaza; si no, es un
+  // fragmento nuevo y se suma.
+  const sessionFinalTextRef = useRef('');
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const consecutiveRecognitionErrorsRef = useRef(0);
   const reconnectAttemptsRef = useRef(0);
@@ -129,7 +153,7 @@ export const useAudioStreaming = (
       silenceTimerRef.current = null;
     }
     turnBufferRef.current = '';
-    sessionFinalSegmentsRef.current = [];
+    sessionFinalTextRef.current = '';
     consecutiveRecognitionErrorsRef.current = 0;
     recognitionRef.current?.stop();
     if (sessionIdRef.current) audioOutputManager.stop(sessionIdRef.current);
@@ -162,7 +186,7 @@ export const useAudioStreaming = (
     setIsMicPaused(true);
     clearSilenceTimer();
     turnBufferRef.current = '';
-    sessionFinalSegmentsRef.current = [];
+    sessionFinalTextRef.current = '';
     recognitionRef.current?.stop();
   }, [clearSilenceTimer]);
 
@@ -226,18 +250,13 @@ export const useAudioStreaming = (
         if (!transcript) continue;
 
         if (result.isFinal) {
-          // Sobrescribimos la posición i en vez de pegar al final: si el
-          // motor vuelve a marcar este mismo índice como final más tarde
-          // (con el texto revisado), reemplaza la versión vieja en vez de
-          // sumarse a ella.
-          sessionFinalSegmentsRef.current[i] = transcript.trim();
+          sessionFinalTextRef.current = mergeFinalSegment(sessionFinalTextRef.current, transcript);
         } else {
           latestInterim = transcript;
         }
       }
 
-      const sessionFinalText = sessionFinalSegmentsRef.current.filter(Boolean).join(' ');
-      const combined = `${turnBufferRef.current} ${sessionFinalText}`.trim();
+      const combined = `${turnBufferRef.current} ${sessionFinalTextRef.current}`.trim();
 
       // El "final" del propio navegador no dispara el envío al toque: solo
       // vamos acumulando el texto confirmado y reiniciando el temporizador
@@ -250,7 +269,7 @@ export const useAudioStreaming = (
       silenceTimerRef.current = setTimeout(() => {
         const finalText = combined;
         turnBufferRef.current = '';
-        sessionFinalSegmentsRef.current = [];
+        sessionFinalTextRef.current = '';
         if (finalText) {
           console.log(`[SpeechRecognition] Turno finalizado tras ${USER_SILENCE_TIMEOUT_MS}ms de silencio (${finalText.length} caracteres).`);
           sendUserFinalTranscript(finalText);
@@ -288,11 +307,10 @@ export const useAudioStreaming = (
     // resultados desde 0, así que "comprometemos" lo ya confirmado de esta
     // sesión al acumulado del turno antes de resetear, para no perderlo.
     recognition.onend = () => {
-      const sessionFinalText = sessionFinalSegmentsRef.current.filter(Boolean).join(' ');
-      if (sessionFinalText) {
-        turnBufferRef.current = `${turnBufferRef.current} ${sessionFinalText}`.trim();
+      if (sessionFinalTextRef.current) {
+        turnBufferRef.current = mergeFinalSegment(turnBufferRef.current, sessionFinalTextRef.current);
       }
-      sessionFinalSegmentsRef.current = [];
+      sessionFinalTextRef.current = '';
       if (shouldRecognizeRef.current && !micPausedRef.current) {
         recognition.start();
       }
