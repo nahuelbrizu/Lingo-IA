@@ -8,7 +8,12 @@ import { prisma } from '../services/prismaService';
 import { conversationTools, summaryTool } from '../config';
 import { handleToolUse, buildToolRoundTrip } from '../services/toolHandlers';
 import { mergeAnalyticProgress, type AnalyticSnapshot } from '../utils/progress';
-import { convertToSpeechSsml, findSentenceBoundary } from '../utils/speech';
+import {
+  convertToSpeechSsml,
+  findSentenceBoundary,
+  stripParentheticalRomanization,
+  splitNativeScriptSegments,
+} from '../utils/speech';
 import { detectSpeechLanguageCode } from '../utils/language';
 import jwt from 'jsonwebtoken';
 import url from 'url';
@@ -68,6 +73,19 @@ const SUPPORTED_LANGUAGES: Record<string, string> = {
 };
 const DEFAULT_LANGUAGE_CODE = 'en-US';
 const DEFAULT_SOURCE_LANGUAGE_CODE = 'es-ES';
+
+// Un alumno que recién empieza no sabe leer kanji/kana ni hanzi — sin la
+// romanización, el texto del chat es indescifrable aunque el audio esté
+// perfecto. Se le pide al tutor que la agregue entre paréntesis junto al
+// texto nativo (así el chat muestra ambas cosas), y esos paréntesis se
+// sacan antes de la síntesis de voz (ver stripParentheticalRomanization en
+// utils/speech.ts) para no leerlos en voz alta.
+const ROMANIZATION_INSTRUCTIONS: Record<string, string> = {
+  'ja-JP':
+    ' Most learners cannot read Japanese script yet: every time you write a word or phrase in Japanese, immediately follow it with its romaji reading in parentheses, e.g. "こんにちは (Konnichiwa)".',
+  'zh-CN':
+    ' Most learners cannot read Chinese characters yet: every time you write a word or phrase in Chinese, immediately follow it with its Hanyu Pinyin reading (with tone marks) in parentheses, e.g. "你好 (Nǐ hǎo)".',
+};
 
 /**
  * Arma el párrafo que se agrega al final del system prompt con lo que ya
@@ -164,7 +182,8 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
     // 2. Setup Claude conversation state
     const BASE_TUTOR_SYSTEM_PROMPT =
-      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation: never use emojis or other pictographic symbols in your responses.`;
+      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation: never use emojis or other pictographic symbols in your responses.` +
+      (ROMANIZATION_INSTRUCTIONS[languageCode] ?? '');
     const messages: Anthropic.MessageParam[] = [];
     console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}), idioma nativo: ${sourceLanguageName}.`);
 
@@ -240,15 +259,50 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
         const queueSpeech = (text: string) => {
           ttsQueue = ttsQueue.then(async () => {
-            if (currentStream?.aborted) return;
-            // El tutor a veces aclara algo en el idioma nativo del alumno
-            // (instruido en el system prompt) — sintetizar esa oración con la
-            // voz del idioma que se practica la vuelve ininteligible, así que
-            // se detecta el idioma real de CADA oración antes de elegir la voz.
-            const speechLanguageCode = await detectSpeechLanguageCode(text, languageCode, sourceLanguageCode);
-            const audioBase64 = await synthesizeSpeech(convertToSpeechSsml(text), speechLanguageCode);
-            if (audioBase64 && !currentStream?.aborted && ws.readyState === ws.OPEN) {
-              send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
+            // El tutor mezcla explicación en el idioma nativo con vocabulario
+            // en japonés/chino DENTRO de la misma oración/párrafo (p.ej. "La
+            // palabra para hola es 你好 (Nǐ hǎo), muy común."). Detectar el
+            // idioma de todo el fragmento junto clasifica esos casos por lo
+            // que predomina en cantidad de caracteres — casi siempre el
+            // idioma nativo — dejando el vocabulario en sí sin pronunciar.
+            // Para japonés/chino separamos por script real (una señal
+            // confiable, ya que nosotros mismos le pedimos al tutor ese
+            // formato) en vez de confiar en la detección de idioma del
+            // fragmento completo, que sigue siendo lo mejor disponible para
+            // el resto de los idiomas (sin esa marca estructural).
+            const segments = languageCode in ROMANIZATION_INSTRUCTIONS
+              ? splitNativeScriptSegments(text)
+              : [{ text, isNativeScript: false }];
+
+            for (const segment of segments) {
+              if (currentStream?.aborted) return;
+
+              let speechLanguageCode: string;
+              let textToSpeak: string;
+              if (languageCode in ROMANIZATION_INSTRUCTIONS) {
+                speechLanguageCode = segment.isNativeScript ? languageCode : sourceLanguageCode;
+                // Cualquier paréntesis en esta sesión es una romanización
+                // (así se lo pedimos al tutor) — se saca siempre, tanto del
+                // segmento nativo como del texto alrededor. Hace falta
+                // incluso en el segmento "no nativo": el corte de oración
+                // puede separar el texto nativo de su romanización en dos
+                // fragmentos distintos (p.ej. "お元気ですか？" queda en un
+                // fragmento y "(Ogenki desu ka?)" arranca el siguiente sin
+                // su ancla japonesa al lado), y sin este paso ese paréntesis
+                // "huérfano" se terminaba leyendo en voz alta tal cual.
+                textToSpeak = stripParentheticalRomanization(segment.text);
+              } else {
+                // El tutor a veces aclara algo en el idioma nativo del
+                // alumno — sintetizar esa oración con la voz del idioma que
+                // se practica la vuelve ininteligible.
+                speechLanguageCode = await detectSpeechLanguageCode(segment.text, languageCode, sourceLanguageCode);
+                textToSpeak = segment.text;
+              }
+
+              const audioBase64 = await synthesizeSpeech(convertToSpeechSsml(textToSpeak), speechLanguageCode);
+              if (audioBase64 && !currentStream?.aborted && ws.readyState === ws.OPEN) {
+                send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
+              }
             }
           });
         };
