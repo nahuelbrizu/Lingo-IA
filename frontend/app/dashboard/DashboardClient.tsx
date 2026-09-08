@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useSession, signOut, signIn } from 'next-auth/react';
 import { useAudioStreaming } from '@/app/hooks/useAudioStreaming';
-import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_SOURCE_LANGUAGE, type LanguageCode } from '@/app/config';
+import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_SOURCE_LANGUAGE, isBeginnerLevel, type LanguageCode } from '@/app/config';
 
 // Importando los nuevos componentes con responsabilidades únicas
 import { ChatHistory } from './components/ChatHistory';
@@ -12,6 +12,7 @@ import { ActionControls } from './components/ActionControls';
 import { VolumeVisualizer } from './components/VolumeVisualizer';
 import { UserProgress } from './components/UserProgress';
 import { LanguageSelector } from './components/LanguageSelector';
+import { TextInputBar } from './components/TextInputBar';
 
 /**
  * @description
@@ -47,6 +48,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     startConversation,
     stopConversation,
     requestTranslation,
+    sendTextMessage,
   } = useAudioStreaming(authToken, targetLanguage, sourceLanguage);
 
   const languageLabel = SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
@@ -98,11 +100,20 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
 
         {/* Área de la conversación de IA */}
         <div className="space-y-5">
-          <ChatHistory chatMessages={chatMessages} onTranslate={requestTranslation} />
+          <ChatHistory
+            chatMessages={chatMessages}
+            onTranslate={requestTranslation}
+            showPronunciationByDefault={isBeginnerLevel(userData?.languageLevel)}
+          />
           <StatusDisplay
             conversationState={conversationState}
             lastUserTranscript={lastUserTranscript}
           />
+
+          {conversationState !== 'idle' && (
+            <TextInputBar disabled={conversationState !== 'listening'} onSend={sendTextMessage} />
+          )}
+
           {authExpired ? (
             <div className="text-center p-4 bg-amber-50 border border-amber-200 rounded-2xl animate-fade-in">
               <p className="text-amber-800 mb-2">Tu sesión expiró. Volvé a entrar para seguir practicando.</p>

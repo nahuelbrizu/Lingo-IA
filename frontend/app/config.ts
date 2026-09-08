@@ -35,6 +35,18 @@ export const DEFAULT_LANGUAGE: LanguageCode = 'en-US';
 /** Idioma nativo del alumno por defecto (usado para las traducciones de ayuda). */
 export const DEFAULT_SOURCE_LANGUAGE: LanguageCode = 'es-ES';
 
+/**
+ * Niveles CEFR que todavía se consideran "principiante" a efectos de UI —
+ * por ejemplo, mostrar siempre la pronunciación de un término en escritura
+ * no latina en vez de ocultarla hasta que la toquen (ver ChatHistory). Un
+ * alumno B1 o más avanzado ya no necesita esa ayuda por defecto.
+ */
+const BEGINNER_LANGUAGE_LEVELS = ['A1', 'A2'];
+
+export function isBeginnerLevel(level?: string | null): boolean {
+  return !level || BEGINNER_LANGUAGE_LEVELS.includes(level);
+}
+
 if (STRICT_UI_MODE) {
   console.warn(
     '%cSTRICT UI MODE ENABLED',

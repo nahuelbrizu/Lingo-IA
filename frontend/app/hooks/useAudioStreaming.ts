@@ -543,5 +543,11 @@ export const useAudioStreaming = (
     startConversation,
     stopConversation,
     requestTranslation,
+    // Mismo camino que usa el reconocimiento de voz al terminar una frase —
+    // se reusa para que el usuario pueda escribir (p.ej. para corregir un
+    // nombre propio que la transcripción de voz no capta bien). El guard de
+    // "solo si conversationState === 'listening'" ya está adentro, así que
+    // no hace falta duplicar esa lógica acá.
+    sendTextMessage: sendUserFinalTranscript,
   };
 };
