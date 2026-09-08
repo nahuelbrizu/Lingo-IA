@@ -73,78 +73,88 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
   }, [conversationState, session?.user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="min-h-screen bg-slate-50 p-4 sm:p-8">
-      <header className="flex justify-between items-center mb-8">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-slate-900">
-            ¡Hola, {userData?.name || 'usuario'}!
-          </h1>
-          <p className="text-slate-500 text-sm sm:text-base">
-            Tu sesión de práctica de {languageLabel.toLowerCase()}.
-          </p>
-        </div>
-        <button
-          onClick={() => signOut()}
-          className="px-4 py-2 bg-red-500 text-white rounded-lg text-sm"
-        >
-          Cerrar Sesión
-        </button>
-      </header>
-
-      {/* Área de la conversación de IA */}
-      <div className="space-y-6">
-        <ChatHistory chatMessages={chatMessages} onTranslate={requestTranslation} />
-        <StatusDisplay
-          conversationState={conversationState}
-          lastUserTranscript={lastUserTranscript}
-        />
-        {authExpired ? (
-          <div className="text-center p-4 bg-amber-50 border border-amber-200 rounded-xl">
-            <p className="text-amber-700 mb-2">Tu sesión expiró. Volvé a entrar para seguir practicando.</p>
-            <button
-              onClick={() => signIn('google')}
-              className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700"
-            >
-              Volver a iniciar sesión
-            </button>
+    <div className="min-h-screen p-4 sm:p-6 lg:p-10">
+      <div className="mx-auto max-w-4xl">
+        <header className="flex flex-wrap justify-between items-center gap-4 mb-8">
+          <div>
+            <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
+              ¡Hola, {userData?.name || 'usuario'}!
+            </h1>
+            <p className="text-slate-500 text-sm sm:text-base mt-1">
+              Tu sesión de práctica de{' '}
+              <span className="font-medium text-indigo-600">
+                {languageLabel.toLowerCase()}
+              </span>
+              .
+            </p>
           </div>
-        ) : (
-          errorMessage && <p className="text-red-500 text-center">{errorMessage}</p>
-        )}
+          <button
+            onClick={() => signOut()}
+            className="px-4 py-2 rounded-full text-sm font-medium text-rose-600 bg-rose-50 border border-rose-100 hover:bg-rose-100 hover:text-rose-700 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400 focus-visible:ring-offset-2"
+          >
+            Cerrar Sesión
+          </button>
+        </header>
 
-        <div className="flex flex-wrap justify-center gap-4">
-          <LanguageSelector
-            label="Idioma nativo (para traducciones):"
-            value={sourceLanguage}
-            onChange={setSourceLanguage}
-            disabled={conversationState !== 'idle'}
+        {/* Área de la conversación de IA */}
+        <div className="space-y-5">
+          <ChatHistory chatMessages={chatMessages} onTranslate={requestTranslation} />
+          <StatusDisplay
+            conversationState={conversationState}
+            lastUserTranscript={lastUserTranscript}
           />
-          <LanguageSelector
-            label="Idioma a practicar:"
-            value={targetLanguage}
-            onChange={setTargetLanguage}
-            disabled={conversationState !== 'idle'}
-          />
+          {authExpired ? (
+            <div className="text-center p-4 bg-amber-50 border border-amber-200 rounded-2xl animate-fade-in">
+              <p className="text-amber-800 mb-2">Tu sesión expiró. Volvé a entrar para seguir practicando.</p>
+              <button
+                onClick={() => signIn('google')}
+                className="px-4 py-2 bg-amber-600 text-white rounded-full text-sm font-medium hover:bg-amber-700 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 focus-visible:ring-offset-2"
+              >
+                Volver a iniciar sesión
+              </button>
+            </div>
+          ) : (
+            errorMessage && (
+              <p className="text-rose-600 text-center text-sm font-medium animate-fade-in">
+                {errorMessage}
+              </p>
+            )
+          )}
+
+          <div className="flex flex-wrap justify-center gap-3 sm:gap-4">
+            <LanguageSelector
+              label="Idioma nativo (para traducciones):"
+              value={sourceLanguage}
+              onChange={setSourceLanguage}
+              disabled={conversationState !== 'idle'}
+            />
+            <LanguageSelector
+              label="Idioma a practicar:"
+              value={targetLanguage}
+              onChange={setTargetLanguage}
+              disabled={conversationState !== 'idle'}
+            />
+          </div>
+
+          <div className="flex items-center justify-center gap-6 p-5 sm:p-6 glass-panel rounded-3xl shadow-soft">
+            <ActionControls
+              conversationState={conversationState}
+              startConversation={startConversation}
+              stopConversation={stopConversation}
+            />
+            <VolumeVisualizer
+              conversationState={conversationState}
+              isMicPaused={isMicPaused}
+            />
+          </div>
         </div>
 
-        <div className="flex items-center justify-center space-x-4 p-4 bg-white rounded-2xl shadow-sm border border-slate-100">
-          <ActionControls
-            conversationState={conversationState}
-            startConversation={startConversation}
-            stopConversation={stopConversation}
-          />
-          <VolumeVisualizer
-            conversationState={conversationState}
-            isMicPaused={isMicPaused}
-          />
-        </div>
+        {/* Línea divisoria */}
+        <div className="my-10 h-px bg-gradient-to-r from-transparent via-slate-300/70 to-transparent" />
+
+        {/* Área de progreso del usuario */}
+        <UserProgress data={userData} isLoading={isLoadingData} />
       </div>
-
-      {/* Línea divisoria */}
-      <hr className="my-10 border-slate-200" />
-
-      {/* Área de progreso del usuario */}
-      <UserProgress data={userData} isLoading={isLoadingData} />
     </div>
   );
 }

@@ -28,10 +28,10 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
     }
     const token = match[0];
     if (token.startsWith('**')) {
-      nodes.push(<strong key={`${keyPrefix}-${key++}`}>{token.slice(2, -2)}</strong>);
+      nodes.push(<strong key={`${keyPrefix}-${key++}`} className="font-semibold">{token.slice(2, -2)}</strong>);
     } else if (token.startsWith('`')) {
       nodes.push(
-        <code key={`${keyPrefix}-${key++}`} className="bg-black/10 rounded px-1 py-0.5 text-[0.9em]">
+        <code key={`${keyPrefix}-${key++}`} className="bg-black/10 rounded px-1 py-0.5 text-[0.9em] font-mono">
           {token.slice(1, -1)}
         </code>
       );
@@ -80,19 +80,19 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
   };
 
   return (
-    <div className="mb-6 p-4 bg-white rounded-2xl shadow-lg border border-slate-100 h-96 overflow-y-auto">
+    <div className="mb-6 p-3 sm:p-4 glass-panel rounded-3xl shadow-soft-lg h-96 overflow-y-auto scrollbar-thin">
       <div className="space-y-4">
         {chatMessages.map((msg, index) => (
           msg.sender === 'system' ? (
-            <div key={index} className="flex justify-center">
-              <p className="max-w-sm md:max-w-md text-center text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 leading-relaxed whitespace-pre-wrap">
+            <div key={index} className="flex justify-center animate-message-in">
+              <p className="max-w-sm md:max-w-md text-center text-xs text-slate-500 bg-slate-100/80 border border-slate-200/80 rounded-xl px-4 py-2.5 leading-relaxed whitespace-pre-wrap">
                 {msg.text}
               </p>
             </div>
           ) : (
           <div
             key={index}
-            className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}
+            className={`flex flex-col animate-message-in ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}
           >
             <div
               className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -100,8 +100,8 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
               <div
                 className={`max-w-xs md:max-w-md lg:max-w-lg px-4 py-2.5 rounded-2xl leading-relaxed whitespace-pre-wrap shadow-sm ${
                   msg.sender === 'user'
-                    ? 'bg-blue-600 text-white rounded-br-sm'
-                    : 'bg-slate-100 text-slate-800 rounded-bl-sm'
+                    ? 'bg-gradient-to-br from-indigo-600 to-violet-600 text-white rounded-br-md'
+                    : 'bg-white text-slate-800 border border-slate-200/80 rounded-bl-md'
                 }`}
               >
                 {renderInlineMarkdown(msg.text, `msg-${index}`)}
@@ -112,12 +112,12 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
               <div className="mt-1.5 max-w-xs md:max-w-md lg:max-w-lg px-1">
                 <button
                   onClick={() => toggleTranslation(index, msg)}
-                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline font-medium"
+                  className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-800 font-medium rounded transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-1"
                 >
                   {shownTranslations.has(index) ? 'Ocultar traducción' : '🌐 Traducir'}
                 </button>
                 {shownTranslations.has(index) && (
-                  <p className="text-xs text-slate-500 italic mt-1 leading-relaxed">
+                  <p className="text-xs text-slate-500 italic mt-1 leading-relaxed animate-fade-in">
                     {msg.isTranslating ? 'Traduciendo...' : renderInlineMarkdown(msg.translation ?? '', `tr-${index}`)}
                   </p>
                 )}
