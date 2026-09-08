@@ -82,9 +82,9 @@ const DEFAULT_SOURCE_LANGUAGE_CODE = 'es-ES';
 // utils/speech.ts) para no leerlos en voz alta.
 const ROMANIZATION_INSTRUCTIONS: Record<string, string> = {
   'ja-JP':
-    ' Most learners cannot read Japanese script yet: every time you write a word or phrase in Japanese, immediately follow it with its romaji reading in parentheses, e.g. "こんにちは (Konnichiwa)".',
+    ' Most learners cannot read Japanese script yet, and pronunciation alone is not enough — they need the meaning too. Every single time you write a word or phrase in Japanese, immediately follow it with its romaji reading in parentheses, then " = " and its meaning in the student\'s native language, e.g. "こんにちは (Konnichiwa) = Hola". Always include the meaning, even if you already explained that exact phrase earlier in the conversation — repeating it bare, with no meaning attached, leaves a beginner stuck.',
   'zh-CN':
-    ' Most learners cannot read Chinese characters yet: every time you write a word or phrase in Chinese, immediately follow it with its Hanyu Pinyin reading (with tone marks) in parentheses, e.g. "你好 (Nǐ hǎo)".',
+    ' Most learners cannot read Chinese characters yet, and pronunciation alone is not enough — they need the meaning too. Every single time you write a word or phrase in Chinese, immediately follow it with its Hanyu Pinyin reading (with tone marks) in parentheses, then " = " and its meaning in the student\'s native language, e.g. "你好 (Nǐ hǎo) = Hola". Always include the meaning, even if you already explained that exact phrase earlier in the conversation — repeating it bare, with no meaning attached, leaves a beginner stuck.',
 };
 
 /**

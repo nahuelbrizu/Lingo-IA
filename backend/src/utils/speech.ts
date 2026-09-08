@@ -84,9 +84,17 @@ export function findSentenceBoundary(text: string): { sentence: string; matchedL
  * no algo que deba escucharse: Google TTS la leería letra por letra en la
  * voz japonesa/china, sonando doble y raro. El chat de texto sigue
  * mostrando ambas cosas sin cambios (esto solo se aplica al audio).
+ *
+ * También saca el "=" que el tutor usa como conector antes del significado
+ * (ej. "こんにちは (Konnichiwa) = Hola") — el significado en sí SÍ se deja
+ * (está bien que se escuche, refuerza el significado de oído), pero el
+ * símbolo "=" no tiene por qué leerse literal como una palabra.
  */
 export function stripParentheticalRomanization(text: string): string {
-  return text.replace(/\s*\([^)]*\)/g, '').trim();
+  return text
+    .replace(/\s*\([^)]*\)/g, '')
+    .replace(/\s*=\s*/g, ' ')
+    .trim();
 }
 
 export interface SpeechSegment {

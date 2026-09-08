@@ -92,6 +92,10 @@ describe('stripParentheticalRomanization', () => {
   it('leaves text with no parentheses unchanged', () => {
     expect(stripParentheticalRomanization('こんにちは')).toBe('こんにちは');
   });
+
+  it('strips a bare "=" connector left over after removing the romanization, so it is never read aloud as a symbol', () => {
+    expect(stripParentheticalRomanization('こんにちは (Konnichiwa) = Hola')).toBe('こんにちは Hola');
+  });
 });
 
 describe('splitNativeScriptSegments', () => {
