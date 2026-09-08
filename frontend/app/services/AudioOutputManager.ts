@@ -108,10 +108,22 @@ class AudioOutputManager {
 
         this.clearWatchdog();
 
+        // Guarda contra doble ejecución: si el watchdog fuerza el corte y el
+        // "onended" real del source todavía dispara después (ver más abajo,
+        // puede pasar con clips muy cortos donde el navegador subestima la
+        // duración del MP3), esta bandera evita que la segunda llamada vuelva
+        // a avanzar la cola — eso era lo que hacía sonar dos chunks pisados
+        // entre sí, sobre todo en el primer mensaje (con fragmentos cortos
+        // como "¡Hola!").
+        let ended = false;
         const handlePlaybackEnd = (isError: boolean = false, errorMessage?: string) => {
+          if (ended) return;
+          ended = true;
           this.clearWatchdog();
           if (isError) console.error(errorMessage);
-          this.activeSource = null;
+          if (this.activeSource === source) {
+            this.activeSource = null;
+          }
           this.isPlaying = false;
           resolve();
           if (generationId === this.currentGenerationId && this.queue.length === 0) {
@@ -127,7 +139,16 @@ class AudioOutputManager {
         const durationMs = audioBuffer.duration * 1000;
         this.watchdogTimer = setTimeout(() => {
           const errorMessage = `[AudioOutputManager] WATCHDOG: Playback excedió el tiempo (gen: ${generationId}). Forzando liberación.`;
-          this.activeSource?.disconnect();
+          // No alcanza con desconectar: un source desconectado sigue "vivo"
+          // internamente y su onended original puede disparar más tarde de
+          // todos modos. Hay que anular ese callback y detenerlo de verdad.
+          source.onended = null;
+          try {
+            source.stop();
+          } catch {
+            // Puede que ya haya terminado por su cuenta; no pasa nada.
+          }
+          source.disconnect();
           handlePlaybackEnd(true, errorMessage);
         }, durationMs + PLAYBACK_TIMEOUT_MARGIN_MS);
 
