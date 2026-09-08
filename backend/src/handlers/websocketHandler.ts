@@ -8,6 +8,8 @@ import { prisma } from '../services/prismaService';
 import { conversationTools, summaryTool } from '../config';
 import { handleToolUse, buildToolRoundTrip } from '../services/toolHandlers';
 import { mergeAnalyticProgress, type AnalyticSnapshot } from '../utils/progress';
+import { convertToSpeechSsml, findSentenceBoundary } from '../utils/speech';
+import { detectSpeechLanguageCode } from '../utils/language';
 import jwt from 'jsonwebtoken';
 import url from 'url';
 
@@ -26,42 +28,18 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const ttsClient = new TextToSpeechClient({ apiKey: process.env.GOOGLE_CLOUD_API_KEY });
 
 /**
- * Quita marcado de Markdown antes de mandar el texto a síntesis de voz.
- * El texto que se muestra en el chat SÍ conserva el markdown (el frontend lo
- * renderiza como énfasis), pero Google TTS lee los símbolos literalmente si
- * se los mandamos tal cual ("asterisco asterisco mi nombre...").
+ * Synthesizes text to speech using Google Cloud TTS. `ssml` debe venir ya
+ * armado (ver convertToSpeechSsml en utils/speech.ts) — así el markdown de
+ * énfasis se escucha como énfasis real en la voz en vez de leerse los
+ * asteriscos literalmente o simplemente borrarse. Devuelve el audio como MP3
+ * en base64 (el navegador lo decodifica directo con Web Audio API), o null
+ * si la síntesis falla — quien llama debe tratar eso como "sin audio este
+ * turno", no como un error fatal.
  */
-// Rango amplio de pictogramas/emoji (incluye modificadores de tono de piel,
-// variation selectors y el Zero Width Joiner usado en emoji compuestos como
-// 👨‍👩‍👧). Google TTS no los ignora en silencio: muchos los lee en voz alta
-// (el nombre del símbolo), y como el chat de texto SÍ puede llegar a
-// mostrarlos "invisibles" según la fuente, el resultado es una voz que
-// menciona algo que el usuario ni ve escrito.
-const EMOJI_PATTERN =
-  /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu;
-
-function stripMarkdownForSpeech(text: string): string {
-  return text
-    .replace(/\*\*(.+?)\*\*/g, '$1')   // **negrita**
-    .replace(/\*(.+?)\*/g, '$1')       // *cursiva*
-    .replace(/`(.+?)`/g, '$1')         // `código`
-    .replace(/^#{1,6}\s+/gm, '')       // # títulos
-    .replace(/^[-*]\s+/gm, '')         // - listas
-    .replace(EMOJI_PATTERN, '')        // emojis (ver EMOJI_PATTERN)
-    .replace(/[ \t]{2,}/g, ' ')        // colapsa espacios que deja el emoji removido
-    .trim();
-}
-
-/**
- * Synthesizes text to speech using Google Cloud TTS. Returns the audio as a
- * base64-encoded MP3 (decodable by the browser's Web Audio API directly), or
- * null if synthesis fails — callers should treat that as "no audio this turn"
- * rather than a fatal error.
- */
-async function synthesizeSpeech(text: string, languageCode: string): Promise<string | null> {
+async function synthesizeSpeech(ssml: string, languageCode: string): Promise<string | null> {
   try {
     const [response] = await ttsClient.synthesizeSpeech({
-      input: { text },
+      input: { ssml },
       voice: { languageCode },
       audioConfig: { audioEncoding: 'MP3' },
     });
@@ -135,7 +113,14 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     const languageName = SUPPORTED_LANGUAGES[languageCode];
 
     const requestedSourceLangCode = queryParams.get('sourceLang') ?? DEFAULT_SOURCE_LANGUAGE_CODE;
-    const sourceLanguageName = SUPPORTED_LANGUAGES[requestedSourceLangCode] ?? SUPPORTED_LANGUAGES[DEFAULT_SOURCE_LANGUAGE_CODE];
+    // Antes no se validaba contra la whitelist (a diferencia de `languageCode`
+    // arriba) — solo se usaba para buscar el nombre legible, con fallback
+    // seguro ahí. Ahora también hace falta el CÓDIGO validado en sí (para
+    // elegir la voz de síntesis cuando el tutor aclara algo en el idioma
+    // nativo), así que se valida igual que el de arriba.
+    const sourceLanguageCode =
+      requestedSourceLangCode in SUPPORTED_LANGUAGES ? requestedSourceLangCode : DEFAULT_SOURCE_LANGUAGE_CODE;
+    const sourceLanguageName = SUPPORTED_LANGUAGES[sourceLanguageCode];
 
     let decoded: AuthTokenPayload;
     try {
@@ -256,26 +241,17 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         const queueSpeech = (text: string) => {
           ttsQueue = ttsQueue.then(async () => {
             if (currentStream?.aborted) return;
-            const audioBase64 = await synthesizeSpeech(stripMarkdownForSpeech(text), languageCode);
+            // El tutor a veces aclara algo en el idioma nativo del alumno
+            // (instruido en el system prompt) — sintetizar esa oración con la
+            // voz del idioma que se practica la vuelve ininteligible, así que
+            // se detecta el idioma real de CADA oración antes de elegir la voz.
+            const speechLanguageCode = await detectSpeechLanguageCode(text, languageCode, sourceLanguageCode);
+            const audioBase64 = await synthesizeSpeech(convertToSpeechSsml(text), speechLanguageCode);
             if (audioBase64 && !currentStream?.aborted && ws.readyState === ws.OPEN) {
               send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
             }
           });
         };
-
-        // Límite de oración para cortar y mandar a sintetizar en cuanto está lista,
-        // sin esperar el resto de la respuesta. Dos variantes:
-        // - Punto (".") seguido de espacio: solo en ese caso exigimos el espacio,
-        //   para no cortar en medio de un número (3.14) o abreviatura (Mr.).
-        // - Signos de exclamación/interrogación, ASCII o de ancho completo
-        //   (!?。！？): son inequívocos como fin de oración, así que no hace falta
-        //   que los siga un espacio. Esto es clave para japonés y chino, que no
-        //   separan oraciones con espacios — exigir uno (como hacíamos antes)
-        //   hacía que la regex nunca matcheara en esos idiomas y toda la
-        //   respuesta se mandara a hablar de una sola vez al final, sin
-        //   streaming oración por oración. El "+" junta signos repetidos
-        //   ("?!", "！？") en un solo corte en vez de trocearlos.
-        const SENTENCE_BOUNDARY = /^([\s\S]*?(?:[.]\s+|[!?。！？]+\s*))/;
 
         // Si un turno termina en tool_use, la API de Anthropic exige un
         // tool_result antes de que el modelo pueda seguir generando —
@@ -303,10 +279,18 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
             fullResponseText += textDelta;
             unspokenText += textDelta;
 
-            let match;
-            while ((match = unspokenText.match(SENTENCE_BOUNDARY))) {
-              unspokenText = unspokenText.slice(match[0].length);
-              queueSpeech(match[1].trim());
+            // findSentenceBoundary (ver utils/speech.ts) corta en el límite de
+            // oración más reciente que tenga el énfasis balanceado — si el
+            // primer "."/"!"/"?" encontrado cae en medio de un "**...**" sin
+            // cerrar, sigue buscando el próximo en vez de cortar ahí (eso
+            // dejaba un asterisco suelto en cada mitad, imposible de volver a
+            // emparejar). Soporta japonés/chino igual que antes (no exige
+            // espacio después de !?。！？, sí después del punto para no cortar
+            // en medio de un número como 3.14).
+            let boundary;
+            while ((boundary = findSentenceBoundary(unspokenText))) {
+              unspokenText = unspokenText.slice(boundary.matchedLength);
+              queueSpeech(boundary.sentence);
             }
           });
 
