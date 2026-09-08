@@ -70,6 +70,8 @@ model Lesson {
 
   feedback String // El resumen pedagógico que la IA genera al final
 
+  suggestedNextLesson String? // Sugerencia de la IA para la próxima sesión; se reinyecta en el prompt de la sesión siguiente
+
 }
 
 

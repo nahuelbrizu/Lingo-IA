@@ -6,6 +6,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import { prisma } from '../services/prismaService';
 import { conversationTools, summaryTool } from '../config';
+import { handleToolUse, buildToolRoundTrip } from '../services/toolHandlers';
+import { mergeAnalyticProgress, type AnalyticSnapshot } from '../utils/progress';
 import jwt from 'jsonwebtoken';
 import url from 'url';
 
@@ -89,6 +91,28 @@ const SUPPORTED_LANGUAGES: Record<string, string> = {
 const DEFAULT_LANGUAGE_CODE = 'en-US';
 const DEFAULT_SOURCE_LANGUAGE_CODE = 'es-ES';
 
+/**
+ * Arma el párrafo que se agrega al final del system prompt con lo que ya
+ * sabemos del alumno de sesiones anteriores. Vacío si no hay nada todavía
+ * (usuario nuevo) — no cambia el prompt de hoy en ese caso.
+ */
+function buildProfileSnippet(analytics: AnalyticSnapshot, previousSuggestion: string | null): string {
+  const parts: string[] = [];
+  if (analytics.masteredTopics.length) {
+    parts.push(`Ya domina: ${analytics.masteredTopics.join(', ')}.`);
+  }
+  if (analytics.commonMistakes.length) {
+    parts.push(`Comete estos errores con frecuencia, prestales atención: ${analytics.commonMistakes.join(', ')}.`);
+  }
+  if (previousSuggestion) {
+    parts.push(
+      `En la sesión anterior se había sugerido seguir con: "${previousSuggestion}". Si tiene sentido, retomá esa idea de forma natural.`
+    );
+  }
+  if (!parts.length) return '';
+  return `\n\nContexto del estudiante (de sesiones anteriores): ${parts.join(' ')} Reconocé su progreso de forma natural cuando sea relevante, no lo recites como una lista.`;
+}
+
 export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
   console.info('Attempting to establish a new WebSocket connection...');
   let userId: string = 'unknown';
@@ -126,8 +150,35 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
     userId = decoded.id;
     console.info(`Client authenticated and connected. User ID: ${userId}`);
 
+    // 1.5 Traer lo que ya sabemos del alumno (temas dominados, errores
+    // frecuentes, sugerencia de la última sesión) para que la conversación
+    // se sienta continua entre sesiones en vez de arrancar en blanco cada
+    // vez. A propósito NO se awaitea acá: cualquier await antes de registrar
+    // ws.on('message') más abajo deja una ventana en la que un mensaje que
+    // llegue del cliente se pierde en silencio (el EventEmitter no lo
+    // guarda para un listener que todavía no existe). En cambio, arranca en
+    // paralelo y se espera recién al procesar el primer turno.
+    let profileSnippet = '';
+    const profileReady = (async () => {
+      try {
+        const profile = await prisma.user.findUnique({
+          where: { id: userId },
+          include: { analytics: true, lessons: { orderBy: { date: 'desc' }, take: 1 } },
+        });
+        profileSnippet = buildProfileSnippet(
+          {
+            masteredTopics: profile?.analytics?.masteredTopics ?? [],
+            commonMistakes: profile?.analytics?.commonMistakes ?? [],
+          },
+          profile?.lessons[0]?.suggestedNextLesson ?? null
+        );
+      } catch (profileError) {
+        console.error(`[Profile] No se pudo cargar el perfil previo de User ID ${userId}:`, profileError);
+      }
+    })();
+
     // 2. Setup Claude conversation state
-    const TUTOR_SYSTEM_PROMPT =
+    const BASE_TUTOR_SYSTEM_PROMPT =
       `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation: never use emojis or other pictographic symbols in your responses.`;
     const messages: Anthropic.MessageParam[] = [];
     console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}), idioma nativo: ${sourceLanguageName}.`);
@@ -182,30 +233,31 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
       console.log(`[Transcript] Final transcript received for User ID ${userId} (${transcript.length} chars).`);
 
       try {
+        // Casi siempre ya está resuelto para cuando el usuario termina de
+        // hablar por primera vez; este await solo espera de verdad en el
+        // caso límite de un turno enviado casi al instante de conectar.
+        await profileReady;
+        const TUTOR_SYSTEM_PROMPT = BASE_TUTOR_SYSTEM_PROMPT + profileSnippet;
+
         messages.push({ role: 'user', content: transcript });
 
         const generationId = randomUUID();
-        const stream = anthropic.messages.stream({
-          model: CLAUDE_MODEL,
-          max_tokens: 1024,
-          system: TUTOR_SYSTEM_PROMPT,
-          tools: conversationTools,
-          messages,
-        });
-        currentStream = stream;
 
         // Sintetizamos oración por oración a medida que Claude va escribiendo, en vez
         // de esperar la respuesta completa: así el audio empieza a sonar mucho antes.
         // Las llamadas a TTS se encadenan (ttsQueue) para mandar los chunks en orden.
+        // Todo esto vive FUERA del loop de abajo: un turno del usuario puede
+        // implicar más de un viaje de ida y vuelta a la API (ver loop), pero
+        // sigue siendo UN solo turno hablado de punta a punta.
         let fullResponseText = '';
         let unspokenText = '';
         let ttsQueue: Promise<void> = Promise.resolve();
 
         const queueSpeech = (text: string) => {
           ttsQueue = ttsQueue.then(async () => {
-            if (stream.aborted) return;
+            if (currentStream?.aborted) return;
             const audioBase64 = await synthesizeSpeech(stripMarkdownForSpeech(text), languageCode);
-            if (audioBase64 && !stream.aborted && ws.readyState === ws.OPEN) {
+            if (audioBase64 && !currentStream?.aborted && ws.readyState === ws.OPEN) {
               send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
             }
           });
@@ -225,31 +277,77 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         //   ("?!", "！？") en un solo corte en vez de trocearlos.
         const SENTENCE_BOUNDARY = /^([\s\S]*?(?:[.]\s+|[!?。！？]+\s*))/;
 
-        stream.on('text', (textDelta) => {
-          send({ type: 'ai_delta', text: textDelta });
-          fullResponseText += textDelta;
-          unspokenText += textDelta;
+        // Si un turno termina en tool_use, la API de Anthropic exige un
+        // tool_result antes de que el modelo pueda seguir generando —
+        // incluída cualquier respuesta hablada. Por eso esto es un loop y no
+        // una sola llamada: puede hacer falta más de un viaje de ida y vuelta
+        // para llegar al texto que realmente se le lee al usuario. El tope
+        // de iteraciones es un salvavidas ante un modelo que quedara
+        // invocando tools sin parar nunca — no se espera que se alcance en
+        // uso normal.
+        const MAX_TOOL_ROUNDTRIPS = 4;
+        let turnFinished = false;
 
-          let match;
-          while ((match = unspokenText.match(SENTENCE_BOUNDARY))) {
-            unspokenText = unspokenText.slice(match[0].length);
-            queueSpeech(match[1].trim());
+        for (let round = 0; round < MAX_TOOL_ROUNDTRIPS; round++) {
+          const stream = anthropic.messages.stream({
+            model: CLAUDE_MODEL,
+            max_tokens: 1024,
+            system: TUTOR_SYSTEM_PROMPT,
+            tools: conversationTools,
+            messages,
+          });
+          currentStream = stream;
+
+          stream.on('text', (textDelta) => {
+            send({ type: 'ai_delta', text: textDelta });
+            fullResponseText += textDelta;
+            unspokenText += textDelta;
+
+            let match;
+            while ((match = unspokenText.match(SENTENCE_BOUNDARY))) {
+              unspokenText = unspokenText.slice(match[0].length);
+              queueSpeech(match[1].trim());
+            }
+          });
+
+          const finalMessage = await stream.finalMessage();
+
+          const toolUseBlocks = finalMessage.content.filter(
+            (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
+          );
+
+          if (toolUseBlocks.length === 0) {
+            messages.push({ role: 'assistant', content: finalMessage.content });
+            turnFinished = true;
+            break;
           }
-        });
 
-        const finalMessage = await stream.finalMessage();
-
-        if (unspokenText.trim()) {
-          queueSpeech(unspokenText.trim());
+          const toolResults = await Promise.all(
+            toolUseBlocks.map(async (toolUseBlock) => ({
+              tool_use_id: toolUseBlock.id,
+              content: await handleToolUse(toolUseBlock, userId),
+            }))
+          );
+          messages.push(...buildToolRoundTrip(finalMessage.content, toolResults));
         }
-        await ttsQueue;
 
-        send({ type: 'ai_final', generationId });
+        if (!turnFinished) {
+          console.error(
+            `[Claude] Tope de ${MAX_TOOL_ROUNDTRIPS} llamadas a tools alcanzado sin respuesta hablada para User ID ${userId}.`
+          );
+          send({ type: 'error', message: 'Error procesando la respuesta de la IA.' });
+        } else {
+          if (unspokenText.trim()) {
+            queueSpeech(unspokenText.trim());
+          }
+          await ttsQueue;
 
-        messages.push({ role: 'assistant', content: finalMessage.content });
-        chatHistory.push(`user: ${transcript}`);
-        chatHistory.push(`model: ${fullResponseText}`);
-        console.log(`[Claude] Turn saved to history for User ID ${userId}.`);
+          send({ type: 'ai_final', generationId });
+
+          chatHistory.push(`user: ${transcript}`);
+          chatHistory.push(`model: ${fullResponseText}`);
+          console.log(`[Claude] Turn saved to history for User ID ${userId}.`);
+        }
 
       } catch (claudeError) {
         if (claudeError instanceof Anthropic.APIUserAbortError) {
@@ -356,21 +454,34 @@ async function handleClose(userId: string, chatHistory: string[]) {
   }
 
   try {
+    // El resumen solo describe lo NUEVO de esta sesión (nunca una lista
+    // "completa" reemplazante) — el merge contra lo que ya había en la DB lo
+    // decide el código (mergeAnalyticProgress, aditivo puro), nunca el
+    // modelo. Así un olvido u omisión de Claude no puede borrar progreso ya
+    // guardado: en el peor caso, no agrega nada nuevo esta vez.
+    const existingAnalytic = await prisma.analytic.findUnique({ where: { userId } });
+    const { masteredTopics, commonMistakes } = mergeAnalyticProgress(
+      {
+        masteredTopics: existingAnalytic?.masteredTopics ?? [],
+        commonMistakes: existingAnalytic?.commonMistakes ?? [],
+      },
+      summary.masteredTopics ?? [],
+      summary.commonMistakes ?? []
+    );
+
     await prisma.$transaction([
       prisma.lesson.create({
-        data: { userId, topic: summary.topic, feedback: summary.feedback },
+        data: {
+          userId,
+          topic: summary.topic,
+          feedback: summary.feedback,
+          suggestedNextLesson: summary.suggestedNextLesson ?? null,
+        },
       }),
       prisma.analytic.upsert({
         where: { userId },
-        update: {
-          masteredTopics: { push: summary.masteredTopics },
-          commonMistakes: { push: summary.commonMistakes },
-        },
-        create: {
-          userId,
-          masteredTopics: summary.masteredTopics,
-          commonMistakes: summary.commonMistakes,
-        },
+        update: { masteredTopics: { set: masteredTopics }, commonMistakes: { set: commonMistakes } },
+        create: { userId, masteredTopics, commonMistakes },
       }),
     ]);
     console.info(`✅ Pedagogical summary saved for ${userId}.`);

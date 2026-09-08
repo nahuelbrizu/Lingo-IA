@@ -2,6 +2,11 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 // Las "manos" de la IA: herramientas que puede usar durante la conversación.
+// (Antes también existía "cambiar_dificultad" acá, pero ningún código en todo
+// el proyecto procesaba esa tool_use ni le devolvía un tool_result — ni
+// siquiera hubiera tenido efecto en el prompt si se hubiera llamado. En vez
+// de simular que "funciona" con un tool_result vacío, se sacó directamente:
+// ajustar la dificultad real es una función aparte, no construida todavía.)
 export const conversationTools: Anthropic.Tool[] = [
   {
     name: 'actualizar_progreso_usuario',
@@ -14,16 +19,6 @@ export const conversationTools: Anthropic.Tool[] = [
         errores_comunes: { type: 'array', items: { type: 'string' }, description: 'Lista de errores que repite' },
       },
       required: ['tema', 'score'],
-    },
-  },
-  {
-    name: 'cambiar_dificultad',
-    description: 'Ajusta el nivel de la conversación si el usuario está muy frustrado o le resulta muy fácil.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        nuevo_nivel: { type: 'string', enum: ['principiante', 'intermedio', 'avanzado'] },
-      },
     },
   },
 ];
