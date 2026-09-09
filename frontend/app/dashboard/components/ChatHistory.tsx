@@ -8,6 +8,13 @@ interface ChatHistoryProps {
   onTranslate: (index: number) => void;
   /** Alumnos principiantes ven la pronunciación siempre; el resto la toca para revelarla. */
   showPronunciationByDefault: boolean;
+  /**
+   * Si se pasa, se muestra un botón "🎤 Practicar" en cada frase de
+   * corrección/ejemplo del chat. Solo tiene sentido pasarlo mientras hay una
+   * conversación en vivo (la práctica reusa el mismo WebSocket) — el padre
+   * debe pasar `undefined` cuando conversationState === 'idle'.
+   */
+  onPracticePhrase?: (phrase: string) => void;
 }
 
 /**
@@ -167,7 +174,7 @@ function parseVocabLine(line: string): { term: string; gloss: string; rest: stri
 
 type MessageBlock =
   | { type: 'vocab'; term: string; gloss: string; rest: string; key: string }
-  | { type: 'highlight'; content: string; key: string }
+  | { type: 'highlight'; content: string; practicePhrase: string | null; key: string }
   | { type: 'text'; content: string; key: string };
 
 // Una línea entera envuelta en "**...**" (nada de texto afuera) — el tutor
@@ -269,9 +276,20 @@ function splitMessageBlocks(text: string, keyPrefix: string): MessageBlock[] {
       index += hasTranslation ? 3 : 2;
     } else if (isListItem || isWholeLineBold || isQuotedExample) {
       flushTextBuffer();
+      // La frase exacta a practicar: la cita entre comillas si matcheó
+      // QUOTED_EXAMPLE_LINE, o el interior de "**...**" si es una línea en
+      // negrita completa. Un ítem de lista simple no tiene una "frase para
+      // repetir" bien definida, así que queda en null (sin botón de práctica).
+      const quotedMatch = QUOTED_EXAMPLE_LINE.exec(trimmed);
+      const practicePhrase = quotedMatch
+        ? quotedMatch[1]
+        : isWholeLineBold
+          ? trimmed.slice(2, -2)
+          : null;
       blocks.push({
         type: 'highlight',
         content: trimmed.replace(LIST_MARKER, ''),
+        practicePhrase,
         key: `${keyPrefix}-b${index}`,
       });
       index++;
@@ -288,11 +306,12 @@ function splitMessageBlocks(text: string, keyPrefix: string): MessageBlock[] {
   return blocks;
 }
 
-const MessageContent: React.FC<{ text: string; keyPrefix: string; showPronunciationByDefault: boolean }> = ({
-  text,
-  keyPrefix,
-  showPronunciationByDefault,
-}) => {
+const MessageContent: React.FC<{
+  text: string;
+  keyPrefix: string;
+  showPronunciationByDefault: boolean;
+  onPracticePhrase?: (phrase: string) => void;
+}> = ({ text, keyPrefix, showPronunciationByDefault, onPracticePhrase }) => {
   const blocks = splitMessageBlocks(text, keyPrefix);
   return (
     <div className="space-y-2">
@@ -314,8 +333,19 @@ const MessageContent: React.FC<{ text: string; keyPrefix: string; showPronunciat
         }
         if (block.type === 'highlight') {
           return (
-            <div key={block.key} className="px-3 py-2 rounded-xl bg-teal-50/80 border border-teal-100 text-sm">
-              {renderInlineMarkdown(block.content, block.key, showPronunciationByDefault)}
+            <div
+              key={block.key}
+              className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-teal-50/80 border border-teal-100 text-sm"
+            >
+              <span>{renderInlineMarkdown(block.content, block.key, showPronunciationByDefault)}</span>
+              {block.practicePhrase && onPracticePhrase && (
+                <button
+                  onClick={() => onPracticePhrase(block.practicePhrase!)}
+                  className="shrink-0 inline-flex items-center gap-1 text-xs font-medium text-violet-700 bg-violet-100 hover:bg-violet-200 rounded-full px-2.5 py-1 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
+                >
+                  🎤 Practicar
+                </button>
+              )}
             </div>
           );
         }
@@ -336,7 +366,7 @@ const MessageContent: React.FC<{ text: string; keyPrefix: string; showPronunciat
  * para pedir una traducción al idioma nativo del alumno — ayuda didáctica para
  * cuando todavía no entiende el idioma que está aprendiendo.
  */
-export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTranslate, showPronunciationByDefault }) => {
+export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTranslate, showPronunciationByDefault, onPracticePhrase }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Si el usuario scrolleó hacia arriba para releer algo mientras la IA
@@ -407,7 +437,12 @@ export const ChatHistory: React.FC<ChatHistoryProps> = ({ chatMessages, onTransl
                 }`}
               >
                 {msg.sender === 'ai' ? (
-                  <MessageContent text={msg.text} keyPrefix={`msg-${index}`} showPronunciationByDefault={showPronunciationByDefault} />
+                  <MessageContent
+                    text={msg.text}
+                    keyPrefix={`msg-${index}`}
+                    showPronunciationByDefault={showPronunciationByDefault}
+                    onPracticePhrase={onPracticePhrase}
+                  />
                 ) : (
                   renderInlineMarkdown(msg.text, `msg-${index}`, showPronunciationByDefault)
                 )}

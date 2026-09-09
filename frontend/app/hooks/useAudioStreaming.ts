@@ -30,11 +30,24 @@ export type ConversationState =
  * transcripciones — solo el texto de la respuesta de la IA, su audio
  * (Google Cloud TTS) y errores.
  */
+export interface PronunciationAssessmentScores {
+  accuracyScore: number;
+  fluencyScore: number;
+  completenessScore: number;
+  pronScore: number;
+}
+
 export type ServerMessage =
   | { type: 'ai_delta'; text: string; generationId: string }
   | { type: 'ai_audio_chunk'; chunk: string; generationId: string }
   | { type: 'ai_final'; generationId: string }
   | { type: 'translation'; messageIndex: number; translatedText: string }
+  | {
+      type: 'pronunciation_assessment_result';
+      targetPhrase: string;
+      result?: PronunciationAssessmentScores;
+      error?: string;
+    }
   | { type: 'error'; message: string };
 
 // --- Helper Functions ---
@@ -136,6 +149,9 @@ export const useAudioStreaming = (
   const [errorMessage, setErrorMessage] = useState('');
   const [authExpired, setAuthExpired] = useState(false);
   const [isMicPaused, setIsMicPaused] = useState(false);
+  const [pronunciationAssessmentResult, setPronunciationAssessmentResult] = useState<
+    { targetPhrase: string; result?: PronunciationAssessmentScores; error?: string } | null
+  >(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
@@ -422,6 +438,13 @@ export const useAudioStreaming = (
           return newMessages;
         });
         break;
+      case 'pronunciation_assessment_result':
+        setPronunciationAssessmentResult({
+          targetPhrase: message.targetPhrase,
+          result: message.result,
+          error: message.error,
+        });
+        break;
       case 'error':
         setErrorMessage(message.message);
         setConversationState('error');
@@ -429,6 +452,18 @@ export const useAudioStreaming = (
         break;
     }
   }, [cleanup, pauseMic, resumeMic]);
+
+  const requestPronunciationAssessment = useCallback((audioBase64: string, targetPhrase: string, sampleRate: number) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setPronunciationAssessmentResult(null);
+    wsRef.current.send(JSON.stringify({
+      type: 'pronunciation_assessment_request',
+      audioBase64,
+      targetPhrase,
+      languageCode: targetLanguage,
+      sampleRate,
+    }));
+  }, [targetLanguage]);
 
   const requestTranslation = useCallback((messageIndex: number) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -549,5 +584,15 @@ export const useAudioStreaming = (
     // "solo si conversationState === 'listening'" ya está adentro, así que
     // no hace falta duplicar esa lógica acá.
     sendTextMessage: sendUserFinalTranscript,
+    // pauseMic/resumeMic ya existen para la transición a ai_speaking — se
+    // reexponen tal cual (sin lógica nueva) para que la práctica de
+    // pronunciación pueda garantizar que SpeechRecognition soltó el
+    // micrófono antes de que usePronunciationRecorder abra su propio
+    // getUserMedia, evitando el problema de dos consumidores simultáneos del
+    // micrófono (ver commit 3f5ee6b).
+    pauseMicForPractice: pauseMic,
+    resumeMicAfterPractice: resumeMic,
+    requestPronunciationAssessment,
+    pronunciationAssessmentResult,
   };
 };

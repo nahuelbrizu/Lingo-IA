@@ -13,6 +13,7 @@ import { VolumeVisualizer } from './components/VolumeVisualizer';
 import { UserProgress } from './components/UserProgress';
 import { LanguageSelector } from './components/LanguageSelector';
 import { TextInputBar } from './components/TextInputBar';
+import { PronunciationPracticeModal } from './components/PronunciationPracticeModal';
 
 /**
  * @description
@@ -49,7 +50,13 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
     stopConversation,
     requestTranslation,
     sendTextMessage,
+    pauseMicForPractice,
+    resumeMicAfterPractice,
+    requestPronunciationAssessment,
+    pronunciationAssessmentResult,
   } = useAudioStreaming(authToken, targetLanguage, sourceLanguage);
+
+  const [practicePhrase, setPracticePhrase] = useState<string | null>(null);
 
   const languageLabel = SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
 
@@ -104,6 +111,7 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
             chatMessages={chatMessages}
             onTranslate={requestTranslation}
             showPronunciationByDefault={isBeginnerLevel(userData?.languageLevel)}
+            onPracticePhrase={conversationState !== 'idle' ? setPracticePhrase : undefined}
           />
           <StatusDisplay
             conversationState={conversationState}
@@ -166,6 +174,15 @@ export default function DashboardClient({ initialData }: { initialData: any }) {
         {/* Área de progreso del usuario */}
         <UserProgress data={userData} isLoading={isLoadingData} />
       </div>
+
+      <PronunciationPracticeModal
+        phrase={practicePhrase}
+        onClose={() => setPracticePhrase(null)}
+        pauseMicForPractice={pauseMicForPractice}
+        resumeMicAfterPractice={resumeMicAfterPractice}
+        requestPronunciationAssessment={requestPronunciationAssessment}
+        pronunciationAssessmentResult={pronunciationAssessmentResult}
+      />
     </div>
   );
 }
