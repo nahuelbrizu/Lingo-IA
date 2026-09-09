@@ -15,6 +15,7 @@ import {
   splitNativeScriptSegments,
 } from '../utils/speech';
 import { detectSpeechLanguageCode } from '../utils/language';
+import { assessPronunciation } from '../services/pronunciationAssessment';
 import jwt from 'jsonwebtoken';
 import url from 'url';
 
@@ -26,11 +27,39 @@ interface AuthTokenPayload {
 
 type ClientMessage =
   | { type: 'user_final'; text: string }
-  | { type: 'translate'; text: string; targetLanguageCode: string; messageIndex: number };
+  | { type: 'translate'; text: string; targetLanguageCode: string; messageIndex: number }
+  | {
+      type: 'pronunciation_assessment_request';
+      audioBase64: string;
+      targetPhrase: string;
+      languageCode: string;
+      sampleRate: number;
+    };
 
 const CLAUDE_MODEL = 'claude-sonnet-5';
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const ttsClient = new TextToSpeechClient({ apiKey: process.env.GOOGLE_CLOUD_API_KEY });
+
+// Sin `name`, Google elige una voz cualquiera que matchee el languageCode —
+// en la práctica, a menudo una voz Standard (más robótica). Se fijan acá
+// voces Neural2/Wavenet explícitas, verificadas una por una contra el
+// listado real de `ttsClient.listVoices()` (no contra documentación de
+// terceros, que puede estar desactualizada) — importa porque no todos los
+// idiomas tienen las mismas letras disponibles, y una voz que no existe
+// rompe la síntesis con un error en vez de sonar peor. cmn-CN usa Wavenet en
+// vez de Neural2 porque Neural2 no existe para chino; Wavenet sigue
+// soportando el `<emphasis>` que arma convertToSpeechSsml (a diferencia de
+// Chirp3:HD, que no lo soporta en ningún idioma salvo tres voces en inglés).
+const VOICE_NAME: Record<string, string> = {
+  'en-US': 'en-US-Neural2-F',
+  'es-ES': 'es-ES-Neural2-A',
+  'fr-FR': 'fr-FR-Neural2-F',
+  'de-DE': 'de-DE-Neural2-G',
+  'it-IT': 'it-IT-Neural2-A',
+  'pt-BR': 'pt-BR-Neural2-A',
+  'ja-JP': 'ja-JP-Neural2-B',
+  'zh-CN': 'cmn-CN-Wavenet-A',
+};
 
 /**
  * Synthesizes text to speech using Google Cloud TTS. `ssml` debe venir ya
@@ -45,7 +74,11 @@ async function synthesizeSpeech(ssml: string, languageCode: string): Promise<str
   try {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { ssml },
-      voice: { languageCode },
+      // Si languageCode no está en VOICE_NAME (no debería pasar con los 8
+      // idiomas soportados, pero por las dudas), se omite `name` y Google
+      // vuelve al comportamiento de selección automática de antes en vez de
+      // fallar la llamada entera.
+      voice: VOICE_NAME[languageCode] ? { languageCode, name: VOICE_NAME[languageCode] } : { languageCode },
       audioConfig: { audioEncoding: 'MP3' },
     });
     if (!response.audioContent) return null;
@@ -182,7 +215,7 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
 
     // 2. Setup Claude conversation state
     const BASE_TUTOR_SYSTEM_PROMPT =
-      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation: never use emojis or other pictographic symbols in your responses.` +
+      `You are a friendly and helpful ${languageName} language tutor. Speak primarily in ${languageName}, at a level appropriate for a learner. The student's native language is ${sourceLanguageName} — think pedagogically: if they seem confused or completely lost, briefly clarify in ${sourceLanguageName} before continuing in ${languageName}, so they can actually follow along. Your goal is to have a natural conversation with the user. Keep your responses concise and natural. This is a spoken, voice-based conversation:` +
       (ROMANIZATION_INSTRUCTIONS[languageCode] ?? '');
     const messages: Anthropic.MessageParam[] = [];
     console.info(`[Claude] Sesión de User ID ${userId} configurada para practicar: ${languageName} (${languageCode}), idioma nativo: ${sourceLanguageName}.`);
@@ -231,6 +264,29 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         return;
       }
 
+      if (payload.type === 'pronunciation_assessment_request') {
+        const targetPhrase = payload.targetPhrase?.trim();
+        if (!targetPhrase || !payload.audioBase64 || !payload.sampleRate) return;
+
+        const assessLanguageCode = payload.languageCode in SUPPORTED_LANGUAGES
+          ? payload.languageCode
+          : languageCode;
+
+        try {
+          const audioBuffer = Buffer.from(payload.audioBase64, 'base64');
+          const outcome = await assessPronunciation(audioBuffer, targetPhrase, assessLanguageCode, payload.sampleRate);
+          if (outcome.ok) {
+            send({ type: 'pronunciation_assessment_result', targetPhrase, result: outcome.data });
+          } else {
+            send({ type: 'pronunciation_assessment_result', targetPhrase, error: outcome.error });
+          }
+        } catch (assessError) {
+          console.error(`[PronunciationAssessment] Error for User ID ${userId}:`, assessError);
+          send({ type: 'pronunciation_assessment_result', targetPhrase, error: 'No se pudo evaluar la pronunciación.' });
+        }
+        return;
+      }
+
       if (payload.type !== 'user_final' || !payload.text?.trim()) return;
       const transcript = payload.text.trim();
 
@@ -257,49 +313,68 @@ export const handleConnection = async (ws: WebSocket, req: IncomingMessage) => {
         let unspokenText = '';
         let ttsQueue: Promise<void> = Promise.resolve();
 
+        // Arranca la síntesis de una oración de inmediato (en paralelo con
+        // cualquier oración anterior todavía sintetizándose) y devuelve una
+        // promesa con sus audios en orden — separado de queueSpeech para que
+        // "cuándo arranca el trabajo" no dependa de "cuándo termina el
+        // trabajo anterior" (ver nota en queueSpeech).
+        const synthesizeSentence = (text: string): Promise<(string | null)[]> => {
+          // El tutor mezcla explicación en el idioma nativo con vocabulario
+          // en japonés/chino DENTRO de la misma oración/párrafo (p.ej. "La
+          // palabra para hola es 你好 (Nǐ hǎo), muy común."). Detectar el
+          // idioma de todo el fragmento junto clasifica esos casos por lo
+          // que predomina en cantidad de caracteres — casi siempre el
+          // idioma nativo — dejando el vocabulario en sí sin pronunciar.
+          // Para japonés/chino separamos por script real (una señal
+          // confiable, ya que nosotros mismos le pedimos al tutor ese
+          // formato) en vez de confiar en la detección de idioma del
+          // fragmento completo, que sigue siendo lo mejor disponible para
+          // el resto de los idiomas (sin esa marca estructural).
+          const segments = languageCode in ROMANIZATION_INSTRUCTIONS
+            ? splitNativeScriptSegments(text)
+            : [{ text, isNativeScript: false }];
+
+          return Promise.all(segments.map(async (segment) => {
+            let speechLanguageCode: string;
+            let textToSpeak: string;
+            if (languageCode in ROMANIZATION_INSTRUCTIONS) {
+              speechLanguageCode = segment.isNativeScript ? languageCode : sourceLanguageCode;
+              // Cualquier paréntesis en esta sesión es una romanización
+              // (así se lo pedimos al tutor) — se saca siempre, tanto del
+              // segmento nativo como del texto alrededor. Hace falta
+              // incluso en el segmento "no nativo": el corte de oración
+              // puede separar el texto nativo de su romanización en dos
+              // fragmentos distintos (p.ej. "お元気ですか？" queda en un
+              // fragmento y "(Ogenki desu ka?)" arranca el siguiente sin
+              // su ancla japonesa al lado), y sin este paso ese paréntesis
+              // "huérfano" se terminaba leyendo en voz alta tal cual.
+              textToSpeak = stripParentheticalRomanization(segment.text);
+            } else {
+              // El tutor a veces aclara algo en el idioma nativo del
+              // alumno — sintetizar esa oración con la voz del idioma que
+              // se practica la vuelve ininteligible.
+              speechLanguageCode = await detectSpeechLanguageCode(segment.text, languageCode, sourceLanguageCode);
+              textToSpeak = segment.text;
+            }
+
+            return synthesizeSpeech(convertToSpeechSsml(textToSpeak), speechLanguageCode);
+          }));
+        };
+
         const queueSpeech = (text: string) => {
+          if (currentStream?.aborted) return;
+          // La síntesis arranca ACÁ, ya — no adentro del .then() de abajo.
+          // Si esto viviera dentro del .then(), la oración 2 no empezaría a
+          // sintetizarse hasta que la 1 terminara de sintetizarse Y
+          // enviarse, agregando la latencia de Google TTS (~400-800ms) en
+          // serie por cada oración. ttsQueue ahora solo ordena el ENVÍO —
+          // sigue siendo la barrera que garantiza que el audio llegue en el
+          // mismo orden en que se escribió, aunque la oración 2 termine de
+          // sintetizarse antes que la 1.
+          const synthesisPromise = synthesizeSentence(text);
           ttsQueue = ttsQueue.then(async () => {
-            // El tutor mezcla explicación en el idioma nativo con vocabulario
-            // en japonés/chino DENTRO de la misma oración/párrafo (p.ej. "La
-            // palabra para hola es 你好 (Nǐ hǎo), muy común."). Detectar el
-            // idioma de todo el fragmento junto clasifica esos casos por lo
-            // que predomina en cantidad de caracteres — casi siempre el
-            // idioma nativo — dejando el vocabulario en sí sin pronunciar.
-            // Para japonés/chino separamos por script real (una señal
-            // confiable, ya que nosotros mismos le pedimos al tutor ese
-            // formato) en vez de confiar en la detección de idioma del
-            // fragmento completo, que sigue siendo lo mejor disponible para
-            // el resto de los idiomas (sin esa marca estructural).
-            const segments = languageCode in ROMANIZATION_INSTRUCTIONS
-              ? splitNativeScriptSegments(text)
-              : [{ text, isNativeScript: false }];
-
-            for (const segment of segments) {
-              if (currentStream?.aborted) return;
-
-              let speechLanguageCode: string;
-              let textToSpeak: string;
-              if (languageCode in ROMANIZATION_INSTRUCTIONS) {
-                speechLanguageCode = segment.isNativeScript ? languageCode : sourceLanguageCode;
-                // Cualquier paréntesis en esta sesión es una romanización
-                // (así se lo pedimos al tutor) — se saca siempre, tanto del
-                // segmento nativo como del texto alrededor. Hace falta
-                // incluso en el segmento "no nativo": el corte de oración
-                // puede separar el texto nativo de su romanización en dos
-                // fragmentos distintos (p.ej. "お元気ですか？" queda en un
-                // fragmento y "(Ogenki desu ka?)" arranca el siguiente sin
-                // su ancla japonesa al lado), y sin este paso ese paréntesis
-                // "huérfano" se terminaba leyendo en voz alta tal cual.
-                textToSpeak = stripParentheticalRomanization(segment.text);
-              } else {
-                // El tutor a veces aclara algo en el idioma nativo del
-                // alumno — sintetizar esa oración con la voz del idioma que
-                // se practica la vuelve ininteligible.
-                speechLanguageCode = await detectSpeechLanguageCode(segment.text, languageCode, sourceLanguageCode);
-                textToSpeak = segment.text;
-              }
-
-              const audioBase64 = await synthesizeSpeech(convertToSpeechSsml(textToSpeak), speechLanguageCode);
+            const audioChunks = await synthesisPromise;
+            for (const audioBase64 of audioChunks) {
               if (audioBase64 && !currentStream?.aborted && ws.readyState === ws.OPEN) {
                 send({ type: 'ai_audio_chunk', chunk: audioBase64, generationId });
               }
